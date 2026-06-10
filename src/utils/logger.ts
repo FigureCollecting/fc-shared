@@ -88,7 +88,7 @@ class Logger {
   }
 
   private get level(): number {
-    return LOG_LEVELS[globalLevel] || LOG_LEVELS.error;
+    return LOG_LEVELS[globalLevel] ?? LOG_LEVELS.error;
   }
 
   private format(...args: unknown[]): string[] {

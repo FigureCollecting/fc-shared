@@ -110,7 +110,7 @@ export function formDataToApiPayload(formData: FigureFormData): FigureApiPayload
       isRerelease: r.isRerelease ?? false,
       variant: r.variant,
     }));
-  } else if (formData.releaseDate || formData.releasePrice || formData.releaseCurrency) {
+  } else if (formData.releaseDate || formData.releasePrice !== undefined || formData.releaseCurrency) {
     payload.releases = [
       {
         date: formData.releaseDate,
@@ -121,12 +121,16 @@ export function formDataToApiPayload(formData: FigureFormData): FigureApiPayload
     ];
   }
 
-  // Handle dimensions
-  if (formData.heightMm || formData.widthMm || formData.depthMm) {
+  // Handle dimensions (0 is a valid measurement, so gate on presence, not truthiness)
+  if (
+    formData.heightMm !== undefined ||
+    formData.widthMm !== undefined ||
+    formData.depthMm !== undefined
+  ) {
     payload.dimensions = {};
-    if (formData.heightMm) payload.dimensions.heightMm = formData.heightMm;
-    if (formData.widthMm) payload.dimensions.widthMm = formData.widthMm;
-    if (formData.depthMm) payload.dimensions.depthMm = formData.depthMm;
+    if (formData.heightMm !== undefined) payload.dimensions.heightMm = formData.heightMm;
+    if (formData.widthMm !== undefined) payload.dimensions.widthMm = formData.widthMm;
+    if (formData.depthMm !== undefined) payload.dimensions.depthMm = formData.depthMm;
   }
 
   // Handle companyRoles
@@ -155,8 +159,8 @@ export function formDataToApiPayload(formData: FigureFormData): FigureApiPayload
     }));
   }
 
-  // Handle purchase info
-  if (formData.purchaseDate || formData.purchasePrice || formData.purchaseCurrency) {
+  // Handle purchase info (price 0 is valid, so gate on presence)
+  if (formData.purchaseDate || formData.purchasePrice !== undefined || formData.purchaseCurrency) {
     payload.purchaseInfo = {};
     if (formData.purchaseDate) payload.purchaseInfo.date = formData.purchaseDate;
     if (formData.purchasePrice !== undefined) payload.purchaseInfo.price = formData.purchasePrice;
