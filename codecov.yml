@@ -1,0 +1,40 @@
+# Codecov configuration
+# https://docs.codecov.com/docs/codecov-yaml
+
+coverage:
+  status:
+    project:
+      default:
+        # Require 70% overall project coverage (matches fc-backend / fc-frontend)
+        target: 70%
+        threshold: 3%
+        informational: false
+    patch:
+      default:
+        # Require 70% coverage on new/changed lines
+        target: 70%
+        threshold: 5%
+        informational: false
+
+comment:
+  layout: "header, diff, flags, files"
+  behavior: default
+  require_head: true
+  require_base: true
+
+flags:
+  shared:
+    paths:
+      - src/
+    carryforward: true
+
+# Exemptions — kept in sync with jest collectCoverageFrom.
+# Pure types and the barrel re-export have no runtime behavior to cover.
+ignore:
+  - "**/*.test.ts"
+  - "**/__tests__/**"
+  - "**/__mocks__/**"
+  - "**/node_modules/**"
+  - "**/dist/**"
+  - "src/types/**"
+  - "src/index.ts"

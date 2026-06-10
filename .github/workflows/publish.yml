@@ -1,0 +1,61 @@
+name: Publish Package
+
+# Publishes @figurecollecting/fc-shared to GitHub Packages (npm) on a v* tag,
+# with a signed SLSA build-provenance attestation. This is the npm analog of the
+# image build+sign flow in the services' docker-publish.yml:
+#   - ephemeral GITHUB_TOKEN (no standing PAT)
+#   - id-token: write -> sigstore-signed provenance, same as image attestation
+# npm versions are immutable, so this is gated on a tag, not on every push.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}   # manual re-run from the Actions UI (matches docker-publish.yml)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read        # checkout
+      packages: write       # publish to npm.pkg.github.com via GITHUB_TOKEN
+      id-token: write       # OIDC token used to sign the provenance attestation
+      attestations: write   # store the attestation against the repo
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@figurecollecting'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify tag matches package.json version
+        run: |
+          PKG_VERSION="v$(node -pe "require('./package.json').version")"
+          if [ "$PKG_VERSION" != "${{ github.ref_name }}" ]; then
+            echo "::error::Tag ${{ github.ref_name }} does not match package.json version ($PKG_VERSION)"
+            exit 1
+          fi
+          echo "Version check OK: $PKG_VERSION"
+
+      - name: Build
+        run: npm run build
+
+      - name: Pack tarball
+        run: npm pack   # -> figurecollecting-fc-shared-<version>.tgz
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: '*.tgz'
+
+      - name: Publish to GitHub Packages
+        run: npm publish *.tgz
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
