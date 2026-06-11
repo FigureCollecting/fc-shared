@@ -23,6 +23,7 @@
   },
   "license": "MIT",
   "dependencies": {
+    "@opentelemetry/api": "^1.9.1",
     "axios": "^1.16.1",
     "zustand": "^5.0.14"
   },
@@ -35,6 +36,7 @@
     }
   },
   "devDependencies": {
+    "@opentelemetry/context-async-hooks": "^2.8.0",
     "@types/jest": "^30.0.0",
     "@types/node": "^25.5.0",
     "@types/react": "^18.2.0",
