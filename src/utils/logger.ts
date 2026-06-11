@@ -8,7 +8,7 @@
  * Or call configureLogger() at app startup to set options.
  */
 
-import { trace } from '@opentelemetry/api';
+import { getTraceContext } from './trace';
 
 type LogLevel = 'verbose' | 'info' | 'warn' | 'error';
 
@@ -78,22 +78,6 @@ const sanitizeArgs = (args: unknown[]): string => {
   return args.map(arg => sanitizeLogValue(arg)).join(' ');
 };
 
-/**
- * Returns `trace=<traceId> span=<spanId>` when an OpenTelemetry span is active,
- * or '' when there is none. This threads a request's traceId through every log
- * line for end-to-end correlation once a host service registers a tracing SDK.
- * It is a no-op (and zero runtime cost) until then, and works the same in node
- * and browser consumers — so adding it here is safe for every fc-shared consumer.
- */
-const traceContext = (): string => {
-  const span = trace.getActiveSpan();
-  if (!span) return '';
-  const ctx = span.spanContext();
-  // An all-zero traceId is the invalid/unsampled context — treat as none.
-  if (!ctx.traceId || /^0+$/.test(ctx.traceId)) return '';
-  return `trace=${ctx.traceId} span=${ctx.spanId}`;
-};
-
 class Logger {
   private module: string;
 
@@ -113,7 +97,7 @@ class Logger {
     // Trace tag is inserted ONLY when a span is active, so with no active span
     // (e.g. tests, or before an SDK is registered) the call shape is unchanged.
     const out = [`[${this.module}]`, new Date().toISOString()];
-    const tc = traceContext();
+    const tc = getTraceContext();
     if (tc) out.push(tc);
     out.push(sanitizeArgs(args));
     return out;

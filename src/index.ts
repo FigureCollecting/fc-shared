@@ -6,3 +6,4 @@ export * from './api/transforms';
 export * from './stores/auth';
 export * from './stores/sync';
 export * from './utils/logger';
+export * from './utils/trace';
