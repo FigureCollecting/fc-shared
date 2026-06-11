@@ -1,4 +1,6 @@
 import { sanitizeLogValue, configureLogger, createLogger } from '../../src/utils/logger';
+import { trace, context, ROOT_CONTEXT } from '@opentelemetry/api';
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 
 describe('sanitizeLogValue', () => {
   it('stringifies null and undefined explicitly', () => {
@@ -108,5 +110,54 @@ describe('Logger', () => {
     configureLogger({ debug: true, level: 'error' });
     createLogger('X').debug('d');
     expect(console.log).toHaveBeenCalled();
+  });
+});
+
+describe('Logger trace correlation', () => {
+  // A real AsyncLocalStorage context manager + a real wrapped span context — no
+  // mocking of the logger, so this exercises the actual correlation path.
+  const contextManager = new AsyncLocalStorageContextManager();
+
+  beforeAll(() => {
+    contextManager.enable();
+    context.setGlobalContextManager(contextManager);
+  });
+  afterAll(() => {
+    context.disable();
+    contextManager.disable();
+  });
+
+  beforeEach(() => {
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    configureLogger({ debug: true, level: 'error' });
+  });
+  afterEach(() => {
+    jest.restoreAllMocks();
+    configureLogger({ debug: false, level: 'error' });
+  });
+
+  const TRACE_ID = 'abcdef12345678901234567890abcdef';
+  const SPAN_ID = 'fedcba0987654321';
+
+  it('threads trace and span ids into the log line when a span is active', () => {
+    const log = createLogger('OTEL');
+    const span = trace.wrapSpanContext({ traceId: TRACE_ID, spanId: SPAN_ID, traceFlags: 1 });
+
+    context.with(trace.setSpan(ROOT_CONTEXT, span), () => {
+      log.error('boom');
+    });
+
+    expect(console.error).toHaveBeenCalledTimes(1);
+    expect((console.error as jest.Mock).mock.calls[0]).toContain(`trace=${TRACE_ID} span=${SPAN_ID}`);
+  });
+
+  it('leaves the log shape unchanged when no span is active', () => {
+    const log = createLogger('OTEL');
+    log.error('boom');
+
+    const args = (console.error as jest.Mock).mock.calls[0];
+    // [OTEL], timestamp, sanitized message — exactly 3 args, no trace tag.
+    expect(args).toHaveLength(3);
+    expect(args.some((a: unknown) => typeof a === 'string' && a.startsWith('trace='))).toBe(false);
   });
 });
