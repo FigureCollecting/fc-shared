@@ -23,6 +23,17 @@ module.exports = {
     '!src/index.ts',
     '!src/types/index.ts'
   ],
+  // Coverage gate (testing doctrine §5): the org 85% target across all four
+  // metrics. The suite currently sits well above this (branches ~88, lines ~98),
+  // so 85 is a one-way floor that can only ratchet up, never down.
+  coverageThreshold: {
+    global: {
+      statements: 85,
+      branches: 85,
+      functions: 85,
+      lines: 85,
+    },
+  },
   coverageDirectory: 'coverage',
   coverageReporters: ['text', 'lcov', 'html'],
   verbose: true,
