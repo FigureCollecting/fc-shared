@@ -12,15 +12,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: No real timers or client mocks in tests
+      - name: No real timers, client/fetch mocks, or snapshots in tests
         run: |
-          # Testing doctrine: fake the network at the boundary (MSW), never mock
-          # the client, and never use real timers. An explicit
-          # "// test-doctrine-allow: <reason>" comment opts a line out.
-          violations=$(grep -rnE "setTimeout|setInterval|jest\.mock\(.?axios|axios\.create\(" tests | grep -v "test-doctrine-allow" || true)
+          # Testing doctrine §8.1: fake the network at the boundary (MSW), never
+          # mock the raw HTTP client (jest.mock('axios'), axios.create stubs, or
+          # global.fetch/globalThis.fetch reassignment), never use real timers,
+          # and no serializer snapshots. Scoped to test files (*.test.*) so
+          # setup.ts and tests/mocks helpers don't false-positive. An explicit
+          # "// test-doctrine-allow: <reason>" comment opts a single line out.
+          violations=$(grep -rnE \
+            "setTimeout|setInterval|jest\.mock\(.?axios|axios\.create\(|global\.fetch[[:space:]]*=|globalThis\.fetch[[:space:]]*=|toMatchSnapshot" \
+            --include='*.test.ts' --include='*.test.tsx' tests \
+            | grep -v "test-doctrine-allow" || true)
           if [ -n "$violations" ]; then
-            echo "::error::Testing-doctrine violations (real timers or client mocks). Add '// test-doctrine-allow: <reason>' if intentional."
+            echo "::error::Testing-doctrine violations (real timers, client/fetch mocks, or snapshots). Add '// test-doctrine-allow: <reason>' if intentional."
             echo "$violations"
+            exit 1
+          fi
+          # Committed serializer snapshots are banned outright — a .snap file has
+          # no inline location to carry the escape-hatch comment.
+          snapshots=$(find tests \( -type d -name '__snapshots__' -o -type f -name '*.snap' \) 2>/dev/null || true)
+          if [ -n "$snapshots" ]; then
+            echo "::error::Committed snapshot artifacts found (testing doctrine bans serializer snapshots)."
+            echo "$snapshots"
             exit 1
           fi
           echo "No testing-doctrine violations found."
