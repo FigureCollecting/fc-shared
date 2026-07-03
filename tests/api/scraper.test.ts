@@ -87,13 +87,16 @@ describe('scraper api — success and the success:false throw path', () => {
     await expect(scraperApi.executeFullSync(api, { cookies, userId: 'u', sessionId: 's' })).rejects.toThrow('sync boom');
   });
 
-  it('parseMfcCsv returns parsed items', async () => {
+  it('parseMfcCsv posts the csv content and returns parsed items', async () => {
+    let body: unknown;
     server.use(
-      http.post(`${BASE}/sync/parse-csv`, () =>
-        HttpResponse.json({ success: true, data: { items: [], stats: { owned: 0, ordered: 0, wished: 0, total: 0, nsfw: 0 } } }),
-      ),
+      http.post(`${BASE}/sync/parse-csv`, async ({ request }) => {
+        body = await request.json();
+        return HttpResponse.json({ success: true, data: { items: [], stats: { owned: 0, ordered: 0, wished: 0, total: 0, nsfw: 0 } } });
+      }),
     );
     expect((await scraperApi.parseMfcCsv(api, 'csv')).items).toEqual([]);
+    expect(body).toEqual({ csvContent: 'csv' });
   });
 
   it('getQueueStats returns stats', async () => {

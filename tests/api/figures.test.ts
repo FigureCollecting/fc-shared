@@ -55,6 +55,9 @@ describe('auth functions', () => {
     expect(user.token).toBe('AT');
     expect(user.refreshToken).toBe('RT');
     expect(user.emailVerified).toBe(false);
+    // Falsy side of the remaining `?? default` fallbacks when the backend omits them.
+    expect(user.twoFactorEnabled).toBe(false);
+    expect(user.webauthnCredentialCount).toBe(0);
     expect(typeof user.tokenExpiresAt).toBe('number');
   });
 
@@ -112,6 +115,11 @@ describe('figures CRUD + queries', () => {
     );
     await figuresApi.getFigures(api);
     expect(url?.searchParams.has('status')).toBe(false);
+    // Parameter defaults when the caller passes nothing.
+    expect(url?.searchParams.get('page')).toBe('1');
+    expect(url?.searchParams.get('limit')).toBe('10');
+    expect(url?.searchParams.get('sortBy')).toBe('activity');
+    expect(url?.searchParams.get('sortOrder')).toBe('asc');
   });
 
   it('getFigureById unwraps response.data.data', async () => {
@@ -692,5 +700,39 @@ describe('failure behavior + resilience', () => {
   it('getFigures rejects on a transport-level network error', async () => {
     server.use(http.get(`${BASE}/figures`, () => HttpResponse.error()));
     await expect(figuresApi.getFigures(api)).rejects.toThrow();
+  });
+});
+
+describe('tokenExpiresAt is exactly Date.now() + 14 minutes', () => {
+  const FIXED = 1_000_000_000_000;
+  afterEach(() => jest.restoreAllMocks());
+
+  it('loginUser stamps the 14-minute expiry off a fixed clock', async () => {
+    jest.spyOn(Date, 'now').mockReturnValue(FIXED);
+    server.use(
+      http.post(`${BASE}/auth/login`, () =>
+        HttpResponse.json({ data: { _id: '1', username: 'u', email: 'a@b.c', isAdmin: false, accessToken: 'AT' } }),
+      ),
+    );
+    const user = (await figuresApi.loginUser(api, 'a@b.c', 'pw')) as Record<string, unknown>;
+    expect(user.tokenExpiresAt).toBe(FIXED + 14 * 60 * 1000);
+  });
+
+  it('registerUser stamps the 14-minute expiry off a fixed clock', async () => {
+    jest.spyOn(Date, 'now').mockReturnValue(FIXED);
+    server.use(
+      http.post(`${BASE}/auth/register`, () =>
+        HttpResponse.json({ data: { _id: '1', username: 'u', email: 'a@b.c', isAdmin: false, accessToken: 'AT' } }),
+      ),
+    );
+    const user = await figuresApi.registerUser(api, 'u', 'a@b.c', 'pw');
+    expect(user.tokenExpiresAt).toBe(FIXED + 14 * 60 * 1000);
+  });
+
+  it('refreshAccessToken stamps the 14-minute expiry off a fixed clock', async () => {
+    jest.spyOn(Date, 'now').mockReturnValue(FIXED);
+    server.use(http.post(`${BASE}/auth/refresh`, () => HttpResponse.json({ data: { accessToken: 'AT' } })));
+    const out = await figuresApi.refreshAccessToken(api, 'old');
+    expect(out.tokenExpiresAt).toBe(FIXED + 14 * 60 * 1000);
   });
 });
