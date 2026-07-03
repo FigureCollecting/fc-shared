@@ -344,7 +344,7 @@ describe('error-interceptor logging branches', () => {
   });
 
   const logged = (spy: jest.SpyInstance): string =>
-    spy.mock.calls.map((c) => c.map((a) => String(a)).join(' ')).join('\n');
+    spy.mock.calls.map((c: unknown[]) => c.map((a: unknown) => String(a)).join(' ')).join('\n');
 
   it('warns "network error" on a response-less error while authenticated', async () => {
     const auth = makeAuth();
