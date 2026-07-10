@@ -75,6 +75,49 @@ export interface IArtistRole {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Display + grounding metadata contract (image-manager -> fc-mobile)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Fractional horizontal center/width (0..1) of the opaque pixels in a matted
+ * figure image's own bottom contact band, as measured by the matting
+ * pipeline. Mirrors fc-mobile's local `ContactBand`
+ * (src/components/display/alphaMargin.ts) field-for-field.
+ */
+export interface FigureContactBand {
+  centerXFrac: number;
+  widthFrac: number;
+}
+
+/**
+ * Display + grounding metadata that the Python image-manager service
+ * PRODUCES (as derivatives of a figure's source image) and fc-mobile
+ * CONSUMES to render the figure matted, correctly grounded, and with a
+ * lightweight placeholder while the real image loads. This is the frozen
+ * cross-service contract: field names/types here are mirrored exactly by
+ * the image-manager Python models — do not rename or retype without
+ * updating both sides.
+ */
+export interface FigureDisplayMeta {
+  /** True when a matted (transparent-background) derivative exists. */
+  matted?: boolean;
+  /** image-manager Image id of the matted derivative. */
+  matteImageId?: string;
+  /** Version id for the /serve/{id}@{v} URL. */
+  matteVersionId?: string;
+  /** Fraction (0..1) of the matte image's own height that is transparent
+   *  padding below the figure's visible content — the grounding correction. */
+  bottomMarginFrac?: number;
+  /** Horizontal ground-contact footprint, measured from the matte's alpha
+   *  channel. */
+  contactBand?: FigureContactBand;
+  /** Compact placeholder hash (ThumbHash) for low-cost blur-up rendering. */
+  thumbhash?: string;
+  /** Dominant color of the source image, as `#RRGGBB`. */
+  dominantColor?: string;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Main Figure Interface (Schema v3.0)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -146,6 +189,9 @@ export interface Figure {
   figureConditionNotes?: string;
   boxCondition?: BoxCondition;
   boxConditionNotes?: string;
+
+  // Display + grounding metadata (image-manager -> fc-mobile contract)
+  displayMeta?: FigureDisplayMeta;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
