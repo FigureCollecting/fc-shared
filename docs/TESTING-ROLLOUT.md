@@ -6,7 +6,7 @@ baseline as of the survey date, and a concrete, file-level, sequenced checklist 
 step lands, check it off here and update the baseline.
 
 **Survey date:** 2026-06-09 (fc-frontend, fc-backend, scraper surveyed in full; fc-shared already
-done; fc-mobile / catalog-* / image-manager / fc-lookup not yet re-surveyed for this tracker).
+done; fc-mobile / library-* / media-manager / fc-lookup not yet re-surveyed for this tracker).
 
 **Nothing here is merged into a service repo yet** — this tracker exists so each adoption lands as a
 reviewed PR against a known baseline, not a blind sweep.

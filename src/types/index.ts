@@ -75,7 +75,7 @@ export interface IArtistRole {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Display + grounding metadata contract (image-manager -> fc-mobile)
+// Display + grounding metadata contract (media-manager -> fc-mobile)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
@@ -90,18 +90,18 @@ export interface FigureContactBand {
 }
 
 /**
- * Display + grounding metadata that the Python image-manager service
+ * Display + grounding metadata that the Python media-manager service
  * PRODUCES (as derivatives of a figure's source image) and fc-mobile
  * CONSUMES to render the figure matted, correctly grounded, and with a
  * lightweight placeholder while the real image loads. This is the frozen
  * cross-service contract: field names/types here are mirrored exactly by
- * the image-manager Python models — do not rename or retype without
+ * the media-manager Python models — do not rename or retype without
  * updating both sides.
  */
 export interface FigureDisplayMeta {
   /** True when a matted (transparent-background) derivative exists. */
   matted?: boolean;
-  /** image-manager Image id of the matted derivative. */
+  /** media-manager Image id of the matted derivative. */
   matteImageId?: string;
   /** Version id for the /serve/{id}@{v} URL. */
   matteVersionId?: string;
@@ -190,7 +190,7 @@ export interface Figure {
   boxCondition?: BoxCondition;
   boxConditionNotes?: string;
 
-  // Display + grounding metadata (image-manager -> fc-mobile contract)
+  // Display + grounding metadata (media-manager -> fc-mobile contract)
   displayMeta?: FigureDisplayMeta;
 }
 
