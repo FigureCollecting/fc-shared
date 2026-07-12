@@ -1,6 +1,6 @@
 // Contract test (testing doctrine Rule 4: compile-error guarantee — see
 // tests/mocks/builders.ts) for the display+grounding metadata that the
-// Python image-manager service PRODUCES and fc-mobile CONSUMES. src/types is
+// Python media-manager service PRODUCES and fc-mobile CONSUMES. src/types is
 // the single TypeScript source of truth for this shape; the Python side
 // mirrors these exact field names/types. This file exists to make a drift
 // in either the shape or its optionality a `tsc --noEmit` failure, not a
@@ -8,7 +8,7 @@
 import { Figure, FigureDisplayMeta } from '../../src/types';
 import { aFigure } from '../mocks/builders';
 
-describe('Figure.displayMeta contract (image-manager -> fc-mobile)', () => {
+describe('Figure.displayMeta contract (media-manager -> fc-mobile)', () => {
   const meta: FigureDisplayMeta = {
     matted: true,
     matteImageId: 'img-abc123',
