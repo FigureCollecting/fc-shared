@@ -20,7 +20,7 @@ jobs:
     if: github.repository_owner == 'FigureCollecting'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
