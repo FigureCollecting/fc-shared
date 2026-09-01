@@ -23,6 +23,9 @@
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
   },
+  "engines": {
+    "node": ">=24.15.0"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && npm run build:esm",
     "build:esm": "esbuild src/index.ts --bundle --format=esm --platform=neutral --packages=external --outfile=dist/index.mjs --sourcemap",
