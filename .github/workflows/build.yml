@@ -16,6 +16,9 @@ on:
 #   owner != FigureCollecting, ref develop|main -> SKIP (fork develop/main are mirrors of upstream: run nothing)
 #   owner != FigureCollecting, any other ref    -> RUN  (shift-left: CI on fork feature branches)
 # Jobs that `needs:` a gated entry job skip cleanly (never fail) when it skips.
+# Note: expression `==` is case-insensitive (GitHub has no case-sensitive
+# compare), so a branch named e.g. `Develop` counts as a mirror; nothing here
+# publishes, so at worst a CI run is skipped or runs on an oddly named branch.
 # Install/build steps authenticate with secrets.NODE_AUTH_TOKEN (fork-held PAT,
 # read:packages only) and fall back to GITHUB_TOKEN on the org; publishing
 # (GHCR push, npm publish, releases) is org-only.
