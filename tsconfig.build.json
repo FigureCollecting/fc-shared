@@ -2,7 +2,8 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "module": "commonjs",
-    "moduleResolution": "node",
+    // TS 6.0 deprecates moduleResolution "node" (node10, TS5107); "bundler" + commonjs is the documented upgrade path
+    "moduleResolution": "bundler",
     "outDir": "dist",
     "rootDir": "src",
     "types": ["node"]
