@@ -15,12 +15,55 @@ Published to GitHub Packages as `@figurecollecting/fc-shared`.
 | `api/transforms` | Request/response transforms |
 | `stores/auth` · `stores/sync` | Zustand stores for auth + sync state |
 | `utils/logger` | Shared logger |
+| `utils/trace` | OpenTelemetry trace-context helpers |
+| `utils/sanitize` | Secret/PII redaction for logs and span attributes |
 
-All exports are re-exported from the package root:
+Everything is re-exported from the package root:
 
 ```ts
 import { /* types, client, stores, ... */ } from '@figurecollecting/fc-shared';
 ```
+
+## Subpath exports
+
+The root barrel pulls in axios, zustand and react. A Node service that only
+wants the trace tag on its log lines should not inherit a browser HTTP client
+and a persisted auth singleton, so four **stateless** modules also resolve on
+their own:
+
+```ts
+import { getTraceContext } from '@figurecollecting/fc-shared/utils/trace';
+import { redactAttributes } from '@figurecollecting/fc-shared/utils/sanitize';
+import { configureLogger } from '@figurecollecting/fc-shared/utils/logger';
+import type { PaginatedResponse } from '@figurecollecting/fc-shared/types';
+```
+
+`@opentelemetry/api` is the only runtime dependency any of them reaches.
+
+`stores/*` and `api/*` deliberately have **no** subpath. They are a persisted
+zustand singleton and the axios client for legacy fc-backend; a second
+resolution path to a module that holds state is how one half of an app ends up
+logged in while the other half is not. `tests/package` enforces both halves of
+this: that the four subpaths stay dependency-free, and that the stateful
+modules stay barrel-only.
+
+The ESM build emits shared chunks, so the barrel and a subpath resolve to one
+instance of a module rather than two copies. Mixing `require` and `import` of
+this package in a single process still yields two instances, as it always has.
+
+## Toolchain baseline
+
+fc-shared is the estate's BOM anchor, and ships the compiler settings that go
+with it. Consuming repos inherit target, module resolution and strictness
+rather than restating them:
+
+```jsonc
+// tsconfig.json
+{ "extends": "@figurecollecting/fc-shared/tsconfig.base.json" }
+```
+
+This repo's own `tsconfig.json` extends the same file, so the baseline cannot
+drift from what consumers get.
 
 ## Installation
 
@@ -49,8 +92,9 @@ npm run build      # tsc -> dist/
 npm run lint       # tsc --noEmit type check
 ```
 
-Only `dist/` is published (see `files` in `package.json`); `prepublishOnly`
-rebuilds it automatically before every publish.
+Only `dist/` and `tsconfig.base.json` are published (see `files` in
+`package.json`); `prepublishOnly` rebuilds `dist/` automatically before every
+publish.
 
 ## CI on forks (shift-left)
 
