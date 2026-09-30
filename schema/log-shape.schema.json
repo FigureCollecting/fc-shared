@@ -16,7 +16,7 @@
     "version": { "description": "Image or package version.", "type": "string", "minLength": 1 },
     "event": {
       "type": "string",
-      "pattern": "^(?:rpc\\.in|rpc\\.out|http\\.in|http\\.out|job\\.start|job\\.end|item\\.enqueue|item\\.process|ingest\\.reject|decision|app\\.[a-z0-9_]+(?:\\.[a-z0-9_]+)*)$"
+      "pattern": "^(?:rpc\\.in|rpc\\.out|http\\.in|http\\.out|job\\.start|job\\.end|item\\.enqueue|item\\.process|item\\.coalesced|ingest\\.reject|decision|app\\.[a-z0-9_]+(?:\\.[a-z0-9_]+)*)$"
     },
     "msg": { "description": "Human text; may be empty.", "type": "string" },
     "call": {
@@ -30,6 +30,11 @@
     "peer": { "description": "In: l5d-client-id, 'unmeshed' or 'invalid'. Out: target authority.", "type": "string", "minLength": 1 },
     "trace_id": { "type": "string", "pattern": "^(?!0{32}$)[0-9a-f]{32}$" },
     "span_id": { "type": "string", "pattern": "^(?!0{16}$)[0-9a-f]{16}$" },
+    "winner_trace_id": {
+      "description": "item.coalesced: the trace id of the enqueue that won (first wins), so a query by either trace id finds the item.",
+      "type": "string",
+      "pattern": "^(?!0{32}$)[0-9a-f]{32}$"
+    },
     "job": { "description": "Kubernetes Job name (downward API).", "type": "string", "minLength": 1 },
     "err": {
       "type": "object",

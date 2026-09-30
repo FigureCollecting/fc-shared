@@ -44,7 +44,9 @@ export const DEFAULT_PROPAGATION_HOSTS: readonly string[] = ['*.svc.cluster.loca
 
 /**
  * Comma-separated exact names or `*.suffix` patterns. When set (not blank) it
- * IS the list, replacing the defaults; a bare `*` matches nothing.
+ * IS the list, replacing the defaults; a bare `*` matches nothing. An entry
+ * written as a URL or with a port (`http://scraper.fc.svc:3050/`) counts as
+ * its host.
  */
 export const PROPAGATION_ALLOWLIST_ENV = 'OTEL_PROPAGATION_ALLOWLIST';
 
@@ -54,12 +56,21 @@ function normaliseHost(host: string): string {
   return host.trim().toLowerCase().replace(/\.$/, '');
 }
 
+/** The host part of an allowlist entry: a leading scheme, a path and a port dropped. */
+function entryHost(entry: string): string {
+  return entry
+    .trim()
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
+    .replace(/[/?#].*$/, '')
+    .replace(/:\d+$/, '');
+}
+
 /** A matcher over exact names and `*.suffix` patterns, case-insensitive. */
 export function createHostAllowlist(entries: readonly string[]): (host: string) => boolean {
   const exact = new Set<string>();
   const suffixes: string[] = [];
   for (const raw of entries) {
-    const entry = normaliseHost(raw);
+    const entry = normaliseHost(entryHost(raw));
     if (entry.startsWith('*.')) {
       if (entry.length > 2) suffixes.push(entry.slice(1));
     } else if (entry !== '') {

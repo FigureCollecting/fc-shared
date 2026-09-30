@@ -73,6 +73,7 @@ export {
 } from './propagation';
 export {
   DROPPED_ATTRIBUTE_KEYS,
+  DROPPED_ATTRIBUTE_PREFIXES,
   RedactingSpanExporter,
   URL_ATTRIBUTE_KEYS,
   redactSpanAttributes,
@@ -118,8 +119,12 @@ export interface StartTracingOptions {
   version?: string;
   /** Environment to read. Default: process.env. */
   env?: Env;
-  /** Instrumentations to register against this provider (e.g. http, undici, pg). */
-  instrumentations?: Instrumentation[];
+  /**
+   * Instrumentations to register against this provider (e.g. http, undici, pg),
+   * flat or nested one level as registerInstrumentations takes them (the
+   * OpenTelemetry docs pass `[getNodeAutoInstrumentations()]`).
+   */
+  instrumentations?: Array<Instrumentation | Instrumentation[]>;
   /** Test seam: export here instead of OTLP (still redacted and batched). */
   exporter?: SpanExporter;
   /** Hosts added to the propagation allowlist (OTEL_PROPAGATION_ALLOWLIST, else its defaults). */
@@ -280,7 +285,9 @@ export function startTracing(service: string, options: StartTracingOptions = {})
     );
   }
 
-  const instrumentations = options.instrumentations ?? [];
+  // Flattened HERE, so the off-list skip reaches every instrumentation that
+  // registerInstrumentations (which flattens one level itself) will enable.
+  const instrumentations = (options.instrumentations ?? []).flat();
   const restoreHooks = skipOffListHosts(instrumentations, isAllowed);
   const unregister = registerInstrumentations({ instrumentations, tracerProvider: provider });
 

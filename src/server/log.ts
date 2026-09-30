@@ -11,6 +11,12 @@
  * are redacted by fc-shared's policy and made log-injection safe
  * (sanitizeLogValue: no newlines, 1000-char cap); objects become one-line JSON.
  *
+ * Every value the logger prints (msg and its parts, err.message, each extra
+ * field, bridged and printf console arguments) goes through one policy: a URL
+ * loses its query, fragment and userinfo; a string that is a whole JSON object
+ * or array is key-redacted; objects are key-redacted in their JSON form (see
+ * printValue). A reserved key other than call and err is typed, not redacted.
+ *
  * The surface is pino-compatible (level, trace..fatal, silent, child), so it can
  * be handed to Fastify as `loggerInstance`. It is promoted from fc-coordinator's
  * src/platform/logger.ts, with the keys renamed to the plan's shape
@@ -30,7 +36,8 @@ import {
   redactValue,
   type RedactOptions,
 } from '../utils/sanitize';
-import { errorField, roundMs } from './fields';
+import { roundMs } from './fields';
+import { stripUrl } from './redact';
 
 export const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal'] as const;
 export type LogLevel = (typeof LOG_LEVELS)[number];
@@ -155,7 +162,7 @@ function isSensitive(key: string, redact: RedactOptions): boolean {
 }
 
 function safeString(value: string, redact: RedactOptions): string {
-  return sanitizeLogValue(redactString(value, redact));
+  return sanitizeLogValue(redactText(value, redact));
 }
 
 /** Flatten one extra field to a scalar the schema accepts. */
@@ -172,49 +179,150 @@ function flatValue(key: string, value: unknown, redact: RedactOptions): Scalar {
     case 'bigint':
       return `${value.toString()}n`;
     case 'object':
-      if (value instanceof Date) return value.toISOString();
-      return sanitizeLogValue(redactValue(value, { ...redact, maxDepth: MAX_FIELD_DEPTH }));
+      return sanitizeLogValue(printValue(value, redact));
     default:
       return `[${typeof value}]`;
   }
 }
 
-/** A plain object or array, walked by key as it is. */
-function isPlainData(value: object): boolean {
-  if (Array.isArray(value)) return true;
-  const proto: unknown = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
+/** util.inspect's hook: an object that defines it has chosen how it is shown. */
+const INSPECT_CUSTOM = Symbol.for('nodejs.util.inspect.custom');
+/** Entries kept per array or object; past it, MAX_ENTRIES - 1 and a count of the rest. */
+const MAX_ENTRIES = 100;
+const TRUNCATED = '[truncated:max-depth]';
+/** What a value (or a whole call) the logger cannot read prints as. */
+const UNSERIALIZABLE = '[unserializable]';
 
 /**
- * The value JSON.stringify would write (toJSON honoured), parsed back.
- * Undefined when there is none: a cycle throws, and so does parsing the
- * undefined a toJSON() returning undefined leaves.
+ * A URL anywhere in text: a scheme (at most 32 characters, so a long word
+ * costs linear time), optional userinfo (up to the last '@' before the path),
+ * host and path, then a query or fragment that runs to the next space or quote.
  */
-function jsonForm(value: object): unknown {
+const URL_IN_TEXT = /([a-z][a-z0-9+.-]{0,31}:\/\/)(?:[^\s/?#"'<>`]*@)?([^\s?#"'<>`]*)(?:[?#][^\s"'<>`]*)?/gi;
+/** A whole value that is a path (or //host/path) carrying a query or fragment. */
+const PATH_WITH_QUERY = /^\/\S*[?#]/;
+
+/**
+ * Text with the query, fragment and userinfo of every `scheme://` URL in it
+ * removed, and a whole path value cut at its query (lg-logging plan-v2: the
+ * logger strips query strings). The rest of the text is kept as written.
+ */
+function stripUrls(text: string): string {
+  const trimmed = text.trim();
+  if (PATH_WITH_QUERY.test(trimmed)) return stripUrl(trimmed);
+  return text.replace(URL_IN_TEXT, '$1$2');
+}
+
+/** The parsed value of a string that is, as a whole, a JSON object or array. */
+function jsonDocument(text: string): object | undefined {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return undefined;
   try {
-    return JSON.parse(JSON.stringify(value)) as unknown;
+    return JSON.parse(trimmed) as object;
   } catch {
     return undefined;
   }
 }
 
 /**
- * Key-based redaction for a value printed into a line (a message part, a
- * bridged console argument), as flatValue applies to a field. A plain object
- * or array is walked as is; an Error becomes {name, message, stack}, never its
- * own properties (an AxiosError's config.headers, for one). Any other object
- * (AxiosHeaders, a session or config class, Map, fetch Headers) is walked in
- * its JSON form, so util.inspect and %o never see the original; a URL or Date
- * becomes its string. One with no JSON form (a cycle) is walked as it is,
- * cycles marked. A primitive is returned unchanged.
+ * A string as the logger prints it. A whole JSON object or array is printed as
+ * an object is and re-emitted compact, up to four strings deep (a fifth prints
+ * the depth marker, never its text). Any other text has the secret-shape
+ * patterns masked and its URLs stripped.
  */
-function redactData(value: unknown, redact: RedactOptions): unknown {
-  if (value === null || typeof value !== 'object') return value;
-  const options = { ...redact, maxDepth: MAX_FIELD_DEPTH };
-  if (isPlainData(value) || value instanceof Error) return redactValue(value, options);
-  const json = jsonForm(value);
-  return redactValue(json === undefined ? value : json, options);
+function redactText(text: string, redact: RedactOptions, nesting = 0): string {
+  const doc = jsonDocument(text);
+  if (doc === undefined) return stripUrls(redactString(text, redact));
+  return nesting < MAX_FIELD_DEPTH ? JSON.stringify(printValue(doc, redact, nesting + 1)) : TRUNCATED;
+}
+
+function isBinary(value: unknown): boolean {
+  return ArrayBuffer.isView(value) || value instanceof ArrayBuffer;
+}
+
+/** `[ClassName]`, or `[object]` when there is no class name. */
+function classLabel(value: object): string {
+  const name: unknown = (value as { constructor?: { name?: unknown } }).constructor?.name;
+  return `[${typeof name === 'string' && name !== '' ? name : 'object'}]`;
+}
+
+/** The array or object itself, or past MAX_ENTRIES its first MAX_ENTRIES - 1 entries and a count of the rest. */
+function bounded(value: object): object {
+  if (Array.isArray(value)) {
+    if (value.length <= MAX_ENTRIES) return value;
+    return [...value.slice(0, MAX_ENTRIES - 1), `[truncated:${value.length - MAX_ENTRIES + 1} more]`];
+  }
+  const keys = Object.keys(value);
+  if (keys.length <= MAX_ENTRIES) return value;
+  const kept: Record<string, unknown> = {};
+  for (const key of keys.slice(0, MAX_ENTRIES - 1)) kept[key] = (value as Record<string, unknown>)[key];
+  kept['[truncated]'] = `${keys.length - MAX_ENTRIES + 1} more`;
+  return kept;
+}
+
+/**
+ * The JSON.stringify replacer behind printValue. JSON.stringify has already
+ * applied toJSON (so AxiosHeaders, a URL or a Date arrive as their JSON form);
+ * the original is read back from the holder.
+ *   - a string: redactText; a bigint: '10n'; a function or symbol: '[function]';
+ *   - an Error: {name, message, stack}, never its own properties (an
+ *     AxiosError's config and response), whatever its toJSON says;
+ *   - binary (Buffer, TypedArray, ArrayBuffer): '[binary]';
+ *   - an object that hides itself, i.e. its toJSON gave nothing or it defines
+ *     util.inspect.custom with no toJSON (fetch Headers, a credential class):
+ *     '[ClassName]';
+ *   - a cycle: '[circular]'; an object four levels down: the depth marker,
+ *     unread; an array or object: at most MAX_ENTRIES entries.
+ */
+function shapeValues(redact: RedactOptions, nesting: number): (this: unknown, key: string, value: unknown) => unknown {
+  const parents = new WeakMap<object, object>();
+  return function shape(this: unknown, key: string, value: unknown): unknown {
+    if (typeof value === 'string') return redactText(value, redact, nesting);
+    if (typeof value === 'bigint') return `${value.toString()}n`;
+    if (typeof value === 'function' || typeof value === 'symbol') return `[${typeof value}]`;
+    const holder = this as Record<string, unknown>;
+    const original = holder[key];
+    if (original instanceof Error) return { name: original.name, message: original.message, stack: original.stack };
+    if (isBinary(original)) return '[binary]';
+    // toJSON gave nothing (value undefined, original an object): it chose not to be shown.
+    if (value === undefined && original !== undefined) return classLabel(original as object);
+    if (typeof value !== 'object' || value === null) return value;
+    if (typeof (value as Record<symbol, unknown>)[INSPECT_CUSTOM] === 'function') return classLabel(value);
+    let depth = 0;
+    for (let above: object | undefined = holder; above !== undefined; above = parents.get(above)) {
+      if (above === value) return '[circular]';
+      depth += 1;
+    }
+    if (depth > MAX_FIELD_DEPTH) return TRUNCATED;
+    const kept = bounded(value);
+    parents.set(kept, holder);
+    return kept;
+  };
+}
+
+/**
+ * Any value as the logger prints it, the one policy behind every extra field,
+ * message part, err and bridged or printf argument. A string goes
+ * through redactText. An object is taken in its JSON form, shaped by
+ * shapeValues, then key-redacted with the logger's options (cookie,
+ * authorization, password ...); a value that cannot be read (a throwing
+ * getter or toJSON, a revoked Proxy) prints as '[unserializable]'. null
+ * stays null; other primitives are returned unchanged.
+ */
+function printValue(value: unknown, redact: RedactOptions, nesting = 0): unknown {
+  if (typeof value === 'string') return redactText(value, redact, nesting);
+  if (typeof value !== 'object') return value;
+  try {
+    return redactValue(JSON.parse(JSON.stringify(value, shapeValues(redact, nesting))) as unknown, redact);
+  } catch {
+    return UNSERIALIZABLE;
+  }
+}
+
+/** The log shape's `err`: {type, message}, the message printed as any other text is. */
+function errField(value: unknown, redact: RedactOptions): { type: string; message: string } {
+  if (value instanceof Error) return { type: value.name, message: safeString(value.message, redact) };
+  return { type: typeof value, message: sanitizeLogValue(printValue(value, redact)) };
 }
 
 function nonNegativeMs(value: unknown): number | undefined {
@@ -263,7 +371,7 @@ function buildEntry(
   if (ids !== undefined) Object.assign(entry, ids);
   const job = reserved['job'] === undefined ? core.job : sanitizeLogValue(reserved['job']);
   if (job !== undefined) entry['job'] = job;
-  if (reserved['err'] !== undefined) entry['err'] = errorField(reserved['err'], core.redact);
+  if (reserved['err'] !== undefined) entry['err'] = errField(reserved['err'], core.redact);
   const queued = nonNegativeMs(reserved['queue_ms']);
   if (queued !== undefined) entry['queue_ms'] = queued;
 
@@ -286,10 +394,10 @@ function toText(entry: Record<string, unknown>): string {
   return Object.entries(rest).reduce((line, [key, value]) => `${line} ${key}=${textValue(value)}`, head);
 }
 
-/** A message part: a string as is, an Error as its message, anything else key-redacted like a field, on one line. */
+/** A message part: an Error as its message, anything else printed as a field value is, on one line. */
 function stringifyArg(arg: unknown, redact: RedactOptions): string {
-  if (typeof arg === 'string') return arg;
-  return sanitizeLogValue(arg instanceof Error ? arg : redactData(arg, redact));
+  if (typeof arg === 'string') return redactText(arg, redact);
+  return sanitizeLogValue(arg instanceof Error ? arg : printValue(arg, redact));
 }
 
 /** pino call shapes: (msg...), (obj, msg...), (err, msg...). */
@@ -311,13 +419,22 @@ function render(core: Core, level: LogLevel, args: unknown[], bindings: Record<s
   return core.format === 'text' ? toText(entry) : JSON.stringify(entry);
 }
 
+/** A log call never throws for what it was given: a call it cannot read at all is one line saying so. */
+function renderSafely(core: Core, level: LogLevel, args: unknown[], bindings: Record<string, unknown>): string {
+  try {
+    return render(core, level, args, bindings);
+  } catch {
+    return render(core, level, [UNSERIALIZABLE], {});
+  }
+}
+
 /** Each logger's redaction options, so the console bridge redacts exactly as its logger does. */
 const REDACT_OF = new WeakMap<Logger, RedactOptions>();
 
 function makeLogger(core: Core, level: LevelSetting, bindings: Record<string, unknown>): Logger {
   const threshold = SEVERITY[level];
   const emit = (at: LogLevel, args: unknown[]): void => {
-    if (SEVERITY[at] >= threshold) core.sink(render(core, at, args, bindings));
+    if (SEVERITY[at] >= threshold) core.sink(renderSafely(core, at, args, bindings));
   };
   const logger: Logger = {
     level,
@@ -385,21 +502,10 @@ const LEADING_TIMESTAMP = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|
 const LEADING_TAG = /^\[([A-Za-z][^\[\]\r\n]{0,63})\]\s*/;
 const PRINTF = /%[sdifjoOc]/;
 
-/** A string that is a (possibly pretty-printed) JSON document, re-emitted compact and redacted. */
-function compactJson(text: string, redact: RedactOptions): string {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return text;
-  try {
-    return JSON.stringify(redactValue(JSON.parse(trimmed), redact));
-  } catch {
-    return text;
-  }
-}
-
 function consoleArg(arg: unknown, redact: RedactOptions): string {
-  if (typeof arg === 'string') return compactJson(arg, redact);
+  if (typeof arg === 'string') return redactText(arg, redact);
   if (arg instanceof Error) return `${arg.name}: ${arg.message}`;
-  return sanitizeLogValue(redactData(arg, redact));
+  return sanitizeLogValue(printValue(arg, redact));
 }
 
 function consoleText(args: unknown[], redact: RedactOptions): string {
@@ -408,23 +514,43 @@ function consoleText(args: unknown[], redact: RedactOptions): string {
     return formatWithOptions(
       { breakLength: Number.POSITIVE_INFINITY, compact: true, colors: false },
       first,
-      ...rest.map((arg) => redactData(arg, redact)),
+      ...rest.map((arg) => printValue(arg, redact)),
     );
   }
   return args.map((arg) => consoleArg(arg, redact)).join(' ');
+}
+
+/** One bridged console call as the (fields, message) the logger prints; an unreadable call says so. */
+function bridgeArgs(args: unknown[], redact: RedactOptions): [Record<string, unknown>, string] {
+  try {
+    let text = consoleText(args, redact).replace(LEADING_TIMESTAMP, '');
+    const fields: Record<string, unknown> = { event: 'app.console' };
+    const tag = LEADING_TAG.exec(text);
+    if (tag !== null) {
+      fields['tag'] = tag[1].trim();
+      text = text.slice(tag[0].length);
+    }
+    const err = args.find((arg) => arg instanceof Error);
+    if (err !== undefined) fields['err'] = err;
+    return [fields, text];
+  } catch {
+    return [{ event: 'app.console' }, UNSERIALIZABLE];
+  }
 }
 
 /**
  * Route console.log/info/warn/error/debug through `logger` as one app.console
  * line each (log -> info). A leading `[TAG]` (spaces allowed, e.g. `[BROWSER
  * POOL]`) becomes the `tag` field, after dropping a leading `[ISO timestamp]`;
- * an Error argument becomes `err`, and a pretty-printed JSON string is
- * collapsed to one line. Every non-string argument, printf arguments included
- * (plain objects, arrays, class instances such as AxiosHeaders, Errors), and
- * every JSON string is key-redacted with the logger's own options (cookie,
- * authorization, password ...), as a logger field would be. An Error prints as
- * `name: message`, or as {name, message, stack} under %o/%O/%j/%s. Free text is
- * covered only by the value patterns (Bearer, JWT, ...), exactly as for msg.
+ * an Error argument becomes `err`. Every argument, printf arguments included,
+ * is printed as a logger field value is, with the logger's own options: a
+ * string that is a whole JSON object or array is key-redacted and made
+ * compact; URLs lose query, fragment and userinfo; objects (plain, class
+ * instances such as AxiosHeaders, Errors) are key-redacted in their JSON form,
+ * and one that hides itself from util.inspect prints as `[ClassName]`. An
+ * Error prints as `name: message`, or as {name, message, stack} under
+ * %o/%O/%j/%s. Other text, the format string included, is covered only by the
+ * secret-shape patterns (Bearer, JWT, ...) and the URL stripping, as msg is.
  * Returns an uninstall function that restores the original methods.
  *
  * A console call made while a bridged line is being written (a sink that itself
@@ -445,16 +571,7 @@ export function installConsoleBridge(logger: Logger, target: ConsoleLike = conso
       }
       writing = true;
       try {
-        let text = consoleText(args, redact).replace(LEADING_TIMESTAMP, '');
-        const fields: Record<string, unknown> = { event: 'app.console' };
-        const tag = LEADING_TAG.exec(text);
-        if (tag !== null) {
-          fields['tag'] = tag[1].trim();
-          text = text.slice(tag[0].length);
-        }
-        const err = args.find((arg) => arg instanceof Error);
-        if (err !== undefined) fields['err'] = err;
-        logger[level](fields, text);
+        logger[level](...bridgeArgs(args, redact));
       } finally {
         writing = false;
       }

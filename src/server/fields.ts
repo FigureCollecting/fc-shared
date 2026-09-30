@@ -3,8 +3,6 @@
  * package: the exports map gives no path to this file.
  */
 import { isSpanContextValid, trace, type Context } from '@opentelemetry/api';
-import { sanitizeLogValue } from '../utils/logger';
-import { redactString, type RedactOptions } from '../utils/sanitize';
 
 /** Round a millisecond measurement to 0.1 ms, the precision the log shape uses. */
 export function roundMs(ms: number): number {
@@ -14,18 +12,6 @@ export function roundMs(ms: number): number {
 /** Milliseconds since a performance.now() reading, rounded. */
 export function elapsedMs(startedAt: number): number {
   return roundMs(Math.max(0, performance.now() - startedAt));
-}
-
-/**
- * The log shape's `err`: {type, message}, message redacted and on one line.
- * A thrown non-Error keeps its JS type name so the line still says what it was.
- */
-export function errorField(value: unknown, redact?: RedactOptions): { type: string; message: string } {
-  if (value instanceof Error) {
-    return { type: value.name, message: sanitizeLogValue(redactString(value.message, redact)) };
-  }
-  const text = typeof value === 'string' ? redactString(value, redact) : value;
-  return { type: typeof value, message: sanitizeLogValue(text) };
 }
 
 /** True when `ctx` already carries a real span (e.g. one opened by http auto-instrumentation). */

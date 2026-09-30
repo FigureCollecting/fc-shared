@@ -88,16 +88,23 @@ npm install @opentelemetry/sdk-trace @opentelemetry/core @opentelemetry/resource
 | `LOG_LEVEL` | minimum level (default `info`) |
 | `FC_LOG_FORMAT=text` | escape hatch: the same fields as one human-readable line |
 | `JOB_NAME` | the Kubernetes Job name (downward API), stamped as `job` |
-| `OTEL_PROPAGATION_ALLOWLIST` | hosts (exact or `*.suffix`, comma-separated) that get `traceparent` and auto spans; replaces the default `*.svc.cluster.local,*.svc,localhost` |
+| `OTEL_PROPAGATION_ALLOWLIST` | hosts (exact or `*.suffix`, comma-separated; an entry written with a scheme or port counts as its host) that get `traceparent` and auto spans; replaces the default `*.svc.cluster.local,*.svc,localhost` |
 
 **Propagation allowlist.** `traceparent` and `baggage` go only to the hosts
 in `OTEL_PROPAGATION_ALLOWLIST` (default `*.svc.cluster.local`, `*.svc` and
 `localhost`), never to store CDNs or other third parties, for every
 instrumented `http` and `fetch` call as well as the Connect client. The `http`
 and `undici` instrumentations skip any other host entirely: no header and no
-auto span (a service that wants a span for a store fetch opens its own). A
-short Service name such as `ingest-server` is not on the default list; use the
-`.svc` name or list it.
+auto span (a service that wants a span for a store fetch opens its own); this
+holds whether `instrumentations` is flat or nested one level, as in
+`[getNodeAutoInstrumentations()]`. A short Service name such as
+`ingest-server` is not on the default list; use the `.svc` name or list it.
+
+**Span redaction.** Before export, `url.full`, `url.original`, `http.url`,
+`http.target` and `db.connection_string` lose their query, fragment and
+userinfo; `url.query` and every `http.request.header.*` and
+`http.response.header.*` attribute are dropped; then the shared key and
+secret-shape policy runs.
 
 **One tracing setup per process.** `startTracing` throws if another
 OpenTelemetry setup (e.g. NodeSDK) already registered the context manager,
@@ -109,12 +116,32 @@ blocks: the queue drops past `maxQueueSize` (2048). `forceFlush`, `shutdown`
 and `runJob`'s final flush do wait, at most `exportTimeoutMillis` (default
 10 s) when the collector accepts connections and never answers.
 
+**Log redaction.** Every value the logger prints (`msg` and its parts,
+`err.message`, each extra field, and every bridged or printf console argument)
+goes through one policy, with the logger's own options. The reserved keys
+other than `call` (cut at its query) and `err` are typed, not redacted.
+
+- a `scheme://` URL anywhere in the text loses its userinfo, and its query and
+  fragment up to the next space or quote; a value that is a whole path
+  (`/login?token=...`) is cut at its query; other text is kept as written;
+- a string that is, as a whole, a JSON object or array is key-redacted and
+  made compact (JSON inside such a string too, up to four levels);
+- an object is key-redacted in its JSON form (`toJSON` honoured): an Error
+  prints as `{name, message, stack}` whatever its `toJSON`, never its own
+  properties; binary data as
+  `[binary]`; an object that hides itself from `util.inspect` (fetch
+  `Headers`, a class with `util.inspect.custom` and no `toJSON`) as
+  `[ClassName]`; four levels and 100 entries per array or object at most;
+- a value that cannot be read (a throwing getter, a revoked Proxy) prints as
+  `[unserializable]`; a log call never throws for what it was given.
+
+Other free text is masked only by the secret-shape patterns (Bearer, JWT,
+...): a secret in prose, or JSON embedded in a longer sentence, is not
+key-redacted.
+
 **Console bridge.** `installConsoleBridge(logger)` turns `console.*` into
-`app.console` lines: a leading `[TAG]` (e.g. `[BROWSER POOL]`) becomes `tag`,
-and every non-string argument (plain objects, class instances such as
-`AxiosHeaders`, Errors, printf arguments) and every JSON string is
-key-redacted with the logger's own options, as logger fields are. Free text
-is masked only by the secret-shape patterns (Bearer, JWT, ...).
+`app.console` lines, redacted as above: a leading `[TAG]` (e.g.
+`[BROWSER POOL]`) becomes `tag`, and an Error argument becomes `err`.
 
 **ESM services** (`"type": "module"`) must preload the OpenTelemetry loader hook,
 or instrumentations (pg, for one) never see modules loaded through `import`:

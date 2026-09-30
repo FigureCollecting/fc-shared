@@ -796,6 +796,8 @@ describe('URLs in log output lose their query, fragment and userinfo (plan-v2 pr
     ['a host with no path', 'https://x.example?k=SECRET', 'https://x.example'],
     ['an @ in the path, not userinfo', 'https://x.example/u/@ross?k=SECRET', 'https://x.example/u/@ross'],
     ['a path with a query', '/login?token=SECRET', '/login'],
+    ['a path with a fragment', '/p#SECRET', '/p'],
+    ['a padded path', '  /login?token=SECRET ', '/login'],
     ['a protocol-relative URL', '//cdn.example/i.jpg?sig=SECRET', '//cdn.example/i.jpg'],
     ['a URL inside text', 'retry https://x.example/a?sig=SECRET in 5s', 'retry https://x.example/a in 5s'],
     ['a URL glued to a word', 'src=https://x.example/a?sig=SECRET', 'src=https://x.example/a'],
@@ -814,6 +816,8 @@ describe('URLs in log output lose their query, fragment and userinfo (plan-v2 pr
     ['a question in text', 'why? because'],
     ['a word with a question mark', 'a?b'],
     ['a path followed by text', '/a b?c'],
+    ['a path inside text', 'see /docs?page=2 for more'],
+    ['a padded number (JSON, but not an object or array)', ' 42 '],
   ])('leaves %s alone', (_label, value) => {
     const { log, parsed } = logger();
     log.info({ link: value });
@@ -895,12 +899,14 @@ describe('URLs in log output lose their query, fragment and userinfo (plan-v2 pr
     target.error('login failed %o', err);
     target.error('attempt', new Attempt(err));
     target.error('retry', { config: err.config });
+    // The two config values that carried a secret, on their own so the 1000-character cap cannot hide them.
+    log.warn({ url: err.config?.url, data: err.config?.data }, 'request');
     uninstall();
-    expect(lines).toHaveLength(6);
+    expect(lines).toHaveLength(7);
     expect(lines.join('\n')).not.toMatch(/hunter2|ACCESS-SECRET|abcdefghijklmnop/);
-    const config = JSON.parse(parsed()[0].config as string) as { url: string; data: string };
-    expect(config.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/login$/);
-    expect(JSON.parse(config.data)).toEqual({ username: 'ross', password: '[REDACTED]' });
+    const request = parsed()[6];
+    expect(request.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/login$/);
+    expect(JSON.parse(request.data as string)).toEqual({ username: 'ross', password: '[REDACTED]' });
   });
 });
 
@@ -912,14 +918,18 @@ describe('JSON strings are key-redacted wherever they are printed', () => {
     log.info({ body: JSON.stringify({ inner: JSON.stringify({ password: 'hunter2' }) }) });
     log.info({ pretty: JSON.stringify({ a: 1, b: [1, 2] }, null, 2) });
     log.info({ list: '[{"cookie":"sid=1"}]', broken: '{"password":"hunter2"' });
+    log.info({ note: 'resp {"password":"hunter2"} done' });
+    log.info({ padded: '  {"password":"hunter2"}\n' });
     const out = parsed();
     expect(out[0].body).toBe('{"password":"[REDACTED]","site":"orzgk"}');
     expect(out[1].msg).toBe('resp {"token":"[REDACTED]"}');
     expect(out[2].body).toBe(JSON.stringify({ inner: JSON.stringify({ password: '[REDACTED]' }) }));
     expect(out[3].pretty).toBe('{"a":1,"b":[1,2]}');
     expect(out[4].list).toBe('[{"cookie":"[REDACTED]"}]');
-    // Not JSON: only the value patterns apply, exactly as for any text.
+    // Not a whole JSON document: only the value patterns apply, as for any text (the documented limit).
     expect(out[4].broken).toBe('{"password":"hunter2"');
+    expect(out[5].note).toBe('resp {"password":"hunter2"} done');
+    expect(out[6].padded).toBe('{"password":"[REDACTED]"}');
     expect(lines.slice(0, 4).join('\n')).not.toMatch(/hunter2|zzz-tok|sid=1/);
   });
 
@@ -1042,6 +1052,8 @@ describe('printing a value never throws and stays bounded', () => {
     revoke();
     const { log, target, uninstall, parsed } = bridged();
     expect(() => {
+      // A bad binding is left out of the fallback line, so the fallback itself cannot throw.
+      log.child({ err: proxy }).info('bound');
       log.info(proxy);
       log.warn('x', proxy);
       log.error({ p: proxy }, 'field');
@@ -1052,12 +1064,14 @@ describe('printing a value never throws and stays bounded', () => {
     const out = parsed();
     expect(out.map((line) => [line.level, line.msg])).toEqual([
       ['info', '[unserializable]'],
+      ['info', '[unserializable]'],
       ['warn', '[unserializable]'],
       ['error', 'field'],
       ['info', '[unserializable]'],
       ['info', '[unserializable]'],
     ]);
-    expect(out[2].p).toBe('[unserializable]');
+    expect(out[3].p).toBe('[unserializable]');
+    expect(out.map((line) => line.event)).toEqual(['app.log', 'app.log', 'app.log', 'app.log', 'app.console', 'app.console']);
     out.forEach(expectValidLine);
   });
 
@@ -1114,10 +1128,12 @@ describe('printing a value never throws and stays bounded', () => {
       tag = Symbol('t');
     })());
     target.log('list', [() => 1, new URL('https://x.example/a?sig=1')]);
+    target.log('sparse', { a: 1, gone: undefined, none: null }, [undefined, null]);
     uninstall();
     expect(msgs()).toEqual([
       'big {"n":"10n","password":"[REDACTED]","tag":"[symbol]"}',
       'list ["[function]","https://x.example/a"]',
+      'sparse {"a":1,"none":null} [null,null]',
     ]);
   });
 
@@ -1148,7 +1164,7 @@ describe('printing a value never throws and stays bounded', () => {
       `wide ${JSON.stringify({ ...keys(99), '[truncated]': '51 more' })}`,
       `keys ${JSON.stringify(keys(100))}`,
     ]);
-    expect(parsed()[4].page).toBe(JSON.stringify({ rows: [...first99, '[truncated:901 more]'] }).slice(0, 1000) + '...[truncated]');
+    expect(parsed()[4].page).toBe(JSON.stringify({ rows: [...first99, '[truncated:901 more]'] }));
   });
 
   it('never reads an object past the fourth level', () => {
@@ -1161,5 +1177,13 @@ describe('printing a value never throws and stays bounded', () => {
     uninstall();
     expect(msgs()[0]).toBe('deep {"a":{"b":{"c":{"d":"[truncated:max-depth]"}}}}');
     expect(parsed()[1].deep).toBe('{"a":{"b":{"c":{"d":"[truncated:max-depth]"}}}}');
+  });
+
+  it('counts the depth through an array it shortened', () => {
+    const rows = Array.from({ length: 150 }, () => ({ a: { b: { c: 1 } } }));
+    const { target, uninstall, msgs } = bridged();
+    target.log('rows', { rows });
+    uninstall();
+    expect((msgs()[0] as string).startsWith('rows {"rows":[{"a":{"b":"[truncated:max-depth]"}},')).toBe(true);
   });
 });

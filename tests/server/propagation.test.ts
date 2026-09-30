@@ -90,6 +90,7 @@ describe('createHostAllowlist', () => {
     'http://scraper.fc.svc',
     'https://Scraper.FC.svc:443/ingest',
     ' scraper.fc.svc. ',
+    ' http://scraper.fc.svc:3050 ',
   ])('reads the host of an entry written as %s', (entry) => {
     const matcher = createHostAllowlist([entry]);
     expect(matcher('scraper.fc.svc')).toBe(true);

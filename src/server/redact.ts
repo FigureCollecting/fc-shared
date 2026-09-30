@@ -6,7 +6,9 @@
  * Store image URLs are often SIGNED (X-Amz-Signature, exp, token), and a
  * connection string may carry a password. So before a span leaves the process:
  *   - every URL-bearing attribute loses its query, fragment and userinfo;
- *   - url.query is dropped outright (it is nothing but the query);
+ *   - url.query is dropped outright (it is nothing but the query), and so is
+ *     every http.request.header.* and http.response.header.* attribute (a
+ *     Referer or Location carries a signed URL, a client IP is personal data);
  *   - then fc-shared's redactAttributes policy runs as for any attribute.
  * Links and events get the same treatment. The original span is never mutated.
  */
@@ -26,6 +28,13 @@ export const URL_ATTRIBUTE_KEYS: readonly string[] = [
 
 /** Attributes removed entirely: they hold only a query string. */
 export const DROPPED_ATTRIBUTE_KEYS: readonly string[] = ['url.query'];
+
+/** Attribute-name prefixes removed entirely: captured request and response headers. */
+export const DROPPED_ATTRIBUTE_PREFIXES: readonly string[] = ['http.request.header.', 'http.response.header.'];
+
+function isDropped(key: string): boolean {
+  return DROPPED_ATTRIBUTE_KEYS.includes(key) || DROPPED_ATTRIBUTE_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
 
 /**
  * Remove query, fragment and userinfo from a URL. A relative target
@@ -47,11 +56,11 @@ export function stripUrl(value: string): string {
   return value.split(/[?#]/)[0];
 }
 
-/** URL stripping, url.query removal, then the shared secret/PII policy. */
+/** URL stripping, url.query and header removal, then the shared secret/PII policy. */
 export function redactSpanAttributes(attributes: Attributes, options: RedactOptions = {}): Attributes {
   const stripped: Attributes = {};
   for (const [key, value] of Object.entries(attributes)) {
-    if (DROPPED_ATTRIBUTE_KEYS.includes(key)) continue;
+    if (isDropped(key)) continue;
     stripped[key] = URL_ATTRIBUTE_KEYS.includes(key) && typeof value === 'string' ? stripUrl(value) : value;
   }
   // The shared policy maps strings to strings and passes other scalars through,
