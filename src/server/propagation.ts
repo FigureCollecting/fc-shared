@@ -1,6 +1,8 @@
 /**
  * Propagation allowlist: traceparent and baggage go ONLY to cluster-internal
- * hosts, never to store CDNs or any third party.
+ * hosts, never to store CDNs or any third party. The list is
+ * OTEL_PROPAGATION_ALLOWLIST (lg-logging plan-v2, propagation_and_redaction),
+ * default `*.svc.cluster.local,*.svc,localhost`.
  *
  * Why it exists: http and undici auto-instrumentation inject W3C headers into
  * EVERY outbound request, including a scraper's fetches of store pages and
@@ -19,6 +21,10 @@
  * No target, or a non-recording span with no attributes: nothing is injected.
  * Extraction (inbound) is never restricted.
  *
+ * startTracing also makes the http and undici instrumentations skip an
+ * off-list host altogether, so such a request gets no auto span either; this
+ * propagator stays as the second line for every other path.
+ *
  * Depends only on @opentelemetry/api, so the Connect interceptors can use it
  * without pulling in the SDK.
  */
@@ -36,8 +42,11 @@ import type { Env } from './log';
 /** Cluster-internal by construction. Loopback IPs are deliberately NOT listed. */
 export const DEFAULT_PROPAGATION_HOSTS: readonly string[] = ['*.svc.cluster.local', '*.svc', 'localhost'];
 
-/** Comma-separated exact names or `*.suffix` patterns ADDED to the defaults. */
-export const PROPAGATE_HOSTS_ENV = 'FC_TRACE_PROPAGATE_HOSTS';
+/**
+ * Comma-separated exact names or `*.suffix` patterns. When set (not blank) it
+ * IS the list, replacing the defaults; a bare `*` matches nothing.
+ */
+export const PROPAGATION_ALLOWLIST_ENV = 'OTEL_PROPAGATION_ALLOWLIST';
 
 const TARGET_KEY = createContextKey('fc-shared propagation target');
 
@@ -63,13 +72,13 @@ export function createHostAllowlist(entries: readonly string[]): (host: string) 
   };
 }
 
-/** The defaults plus FC_TRACE_PROPAGATE_HOSTS; the env can extend, never replace. */
+/** OTEL_PROPAGATION_ALLOWLIST as a list; the defaults when it is unset or blank. */
 export function propagationHostsFromEnv(env: Env): string[] {
-  const extra = (env[PROPAGATE_HOSTS_ENV] ?? '')
+  const listed = (env[PROPAGATION_ALLOWLIST_ENV] ?? '')
     .split(',')
     .map((entry) => entry.trim())
     .filter((entry) => entry !== '');
-  return [...DEFAULT_PROPAGATION_HOSTS, ...extra];
+  return listed.length > 0 ? listed : [...DEFAULT_PROPAGATION_HOSTS];
 }
 
 /** Host of a URL, or of a bare `host[:port]`. Undefined when it cannot be read. */

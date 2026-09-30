@@ -236,12 +236,21 @@ describe('server log line shape', () => {
     log.warn('restored', new (class Session {
       cookie = 'sid=S3CR3T-COOKIE';
     })());
+    // An Error after the message still reads as its message.
+    log.warn('retry after', new Error('socket hang up'));
     expect(lines.join('\n')).not.toMatch(/hunter2|S3CR3T/);
     expect(parsed().map((line) => line.msg)).toEqual([
       'login {"password":"[REDACTED]","site":"orzgk"}',
       'failed for {"headers":{"cookie":"[REDACTED]"}}',
       'restored {"cookie":"[REDACTED]"}',
+      'retry after socket hang up',
     ]);
+  });
+
+  it("redacts those objects with the logger's own options", () => {
+    const { log, parsed } = logger({ redact: { sensitiveKeyPattern: /dpop/i } });
+    log.info('proof', { dpopKey: 'jwk-secret', password: 'visible-under-a-custom-pattern' });
+    expect(parsed()[0].msg).toBe('proof {"dpopKey":"[REDACTED]","password":"visible-under-a-custom-pattern"}');
   });
 
   it('renders err as {type, message} with the message redacted and on one line', () => {
@@ -545,6 +554,7 @@ describe('console bridge', () => {
     target.log(Object.assign(Object.create(null) as object, { token: 't-456' }));
     target.log({ a: { b: { c: { d: { e: 1 } } } } });
     target.log('nothing', null, undefined, 3);
+    target.log({ site: 'orzgk', onDone: () => undefined });
     uninstall();
     expect(lines.join('\n')).not.toMatch(/S3CR3T|hunter2|dXNlcjpodW50ZXIy|k-123|t-456/);
     expect(parsed().map((line) => line.msg)).toEqual([
@@ -554,12 +564,14 @@ describe('console bridge', () => {
       'form {"password":"[REDACTED]"}',
       "login { authorization: '[REDACTED]' }",
       '{"store":"orzgk","session":{"cookie":"[REDACTED]"}}',
-      // An instance whose JSON form is a string (URL) keeps its own string form.
+      // A URL prints as its string.
       'fetching https://img.store-cdn.example/a.jpg',
       '{"token":"[REDACTED]"}',
       // Walked four levels deep, like a logger field.
       '{"a":{"b":{"c":{"d":"[truncated:max-depth]"}}}}',
       'nothing null undefined 3',
+      // A plain object is walked as is: a function shows, as in a field.
+      '{"site":"orzgk","onDone":"[function]"}',
     ]);
   });
 
@@ -593,6 +605,7 @@ describe('console bridge', () => {
     target.error('failed %O', plainError);
     target.error('failed %j', plainError);
     target.log('at %s', new Date('2026-09-29T12:00:00.000Z'));
+    target.log('open', new URL('https://img.store-cdn.example/b.jpg'));
     uninstall();
 
     expect(lines.join('\n')).not.toMatch(/CLASS-|AXIOS-|AXERR-|PLAINERR-|FETCH-HEADERS|MAP-COOKIE|Q0xBU1Mt|QVhJT1M/);
@@ -612,7 +625,35 @@ describe('console bridge', () => {
     expect(msgs[8]).toMatch(/^failed \{ name: 'AxiosError', message: 'Request failed with status code 403', stack: 'AxiosError: /);
     expect(msgs[9]).toMatch(/^failed \{ name: 'Error', message: 'boom', stack: 'Error: boom/);
     expect(msgs[10]).toMatch(/^failed \{"name":"Error","message":"boom","stack":"Error: boom/);
-    expect(msgs[11]).toMatch(/^at .*2026/);
+    // A Date or URL becomes its string.
+    expect(msgs.slice(11)).toEqual(['at 2026-09-29T12:00:00.000Z', 'open https://img.store-cdn.example/b.jpg']);
+  });
+
+  it('walks an instance with no JSON form (a cycle, a toJSON returning undefined), cycles marked', () => {
+    class Circular {
+      name = 'pool';
+      cookie = 'sid=CIRCULAR-COOKIE';
+      self: unknown = this;
+    }
+    class Opaque {
+      cookie = 'sid=OPAQUE-COOKIE';
+      toJSON(): undefined {
+        return undefined;
+      }
+    }
+    const { log, lines, parsed } = logger();
+    const { target } = fakeConsole();
+    const uninstall = installConsoleBridge(log, target);
+    target.log('pool', new Circular());
+    target.log('%o', new Circular());
+    target.log('opaque', new Opaque());
+    uninstall();
+    expect(lines.join('\n')).not.toMatch(/CIRCULAR-COOKIE|OPAQUE-COOKIE/);
+    expect(parsed().map((line) => line.msg)).toEqual([
+      'pool {"name":"pool","cookie":"[REDACTED]","self":"[circular]"}',
+      "{ name: 'pool', cookie: '[REDACTED]', self: '[circular]' }",
+      'opaque {"cookie":"[REDACTED]"}',
+    ]);
   });
 
   it('redacts with the default options when bridging a logger fc-shared did not create', () => {

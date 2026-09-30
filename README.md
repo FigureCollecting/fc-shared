@@ -88,13 +88,16 @@ npm install @opentelemetry/sdk-trace @opentelemetry/core @opentelemetry/resource
 | `LOG_LEVEL` | minimum level (default `info`) |
 | `FC_LOG_FORMAT=text` | escape hatch: the same fields as one human-readable line |
 | `JOB_NAME` | the Kubernetes Job name (downward API), stamped as `job` |
-| `FC_TRACE_PROPAGATE_HOSTS` | extra hosts (exact or `*.suffix`) allowed to receive `traceparent` |
+| `OTEL_PROPAGATION_ALLOWLIST` | hosts (exact or `*.suffix`, comma-separated) that get `traceparent` and auto spans; replaces the default `*.svc.cluster.local,*.svc,localhost` |
 
-**Propagation allowlist.** `traceparent` and `baggage` go only to
-`*.svc.cluster.local`, `*.svc` and `localhost`, never to store CDNs or other
-third parties, for every instrumented `http` and `fetch` call as well as the
-Connect client. A short Service name such as `ingest-server` is not on the
-list; use the `.svc` name or add it through `FC_TRACE_PROPAGATE_HOSTS`.
+**Propagation allowlist.** `traceparent` and `baggage` go only to the hosts
+in `OTEL_PROPAGATION_ALLOWLIST` (default `*.svc.cluster.local`, `*.svc` and
+`localhost`), never to store CDNs or other third parties, for every
+instrumented `http` and `fetch` call as well as the Connect client. The `http`
+and `undici` instrumentations skip any other host entirely: no header and no
+auto span (a service that wants a span for a store fetch opens its own). A
+short Service name such as `ingest-server` is not on the default list; use the
+`.svc` name or list it.
 
 **One tracing setup per process.** `startTracing` throws if another
 OpenTelemetry setup (e.g. NodeSDK) already registered the context manager,
@@ -108,8 +111,10 @@ and `runJob`'s final flush do wait, at most `exportTimeoutMillis` (default
 
 **Console bridge.** `installConsoleBridge(logger)` turns `console.*` into
 `app.console` lines: a leading `[TAG]` (e.g. `[BROWSER POOL]`) becomes `tag`,
-and objects, printf arguments and JSON strings are key-redacted with the
-logger's own options, as logger fields are.
+and every non-string argument (plain objects, class instances such as
+`AxiosHeaders`, Errors, printf arguments) and every JSON string is
+key-redacted with the logger's own options, as logger fields are. Free text
+is masked only by the secret-shape patterns (Bearer, JWT, ...).
 
 **ESM services** (`"type": "module"`) must preload the OpenTelemetry loader hook,
 or instrumentations (pg, for one) never see modules loaded through `import`:

@@ -16,8 +16,11 @@
  *     flush DO wait for the collector, at most exportTimeoutMillis (default
  *     10 s) when it accepts connections and never answers; the OTLP exporter
  *     gets the same deadline, so shutdown is bounded by it too.
- *   - The global propagator is W3C traceparent + baggage behind the
- *     AllowlistPropagator: headers go to cluster-internal hosts only.
+ *   - Propagation allowlist, OTEL_PROPAGATION_ALLOWLIST (default
+ *     `*.svc.cluster.local,*.svc,localhost`): the http and undici
+ *     instrumentations skip any other host (no auto span, no header), and the
+ *     global propagator, W3C traceparent + baggage behind the
+ *     AllowlistPropagator, injects for listed hosts only on every other path.
  *   - An AsyncLocalStorage context manager is registered explicitly, so the
  *     active span survives `await`.
  *   - It must be the process's ONLY OpenTelemetry setup. If another one (e.g.
@@ -62,7 +65,7 @@ import { RedactingSpanExporter, stripUrl } from './redact';
 export {
   AllowlistPropagator,
   DEFAULT_PROPAGATION_HOSTS,
-  PROPAGATE_HOSTS_ENV,
+  PROPAGATION_ALLOWLIST_ENV,
   createHostAllowlist,
   propagationHostsFromEnv,
   propagationTargetOf,
@@ -119,7 +122,7 @@ export interface StartTracingOptions {
   instrumentations?: Instrumentation[];
   /** Test seam: export here instead of OTLP (still redacted and batched). */
   exporter?: SpanExporter;
-  /** Hosts ADDED to the propagation allowlist. */
+  /** Hosts added to the propagation allowlist (OTEL_PROPAGATION_ALLOWLIST, else its defaults). */
   propagateHosts?: readonly string[];
   batch?: BatchOptions;
   /** Service-specific span redaction, e.g. an extra sensitive-key pattern. */
@@ -157,6 +160,57 @@ export function resolveTraceEndpoint(env: Env): string | undefined {
 }
 
 let running: Tracing | undefined;
+
+type IgnoreHook = (request: unknown) => boolean;
+
+/**
+ * Where an instrumentation-http request goes, read as that instrumentation
+ * reads it (hostname, else host up to the port; node's default is localhost).
+ */
+function httpRequestHost(request: unknown): string {
+  const { hostname, host } = request as { hostname?: unknown; host?: unknown };
+  if (typeof hostname === 'string' && hostname !== '') return hostname;
+  const match = /^([^:/ ]+)/.exec(typeof host === 'string' ? host : '');
+  return match === null ? 'localhost' : match[1];
+}
+
+/** Where an instrumentation-undici request (fetch included) goes: its origin's host; undefined if unreadable. */
+function undiciRequestHost(request: unknown): string | undefined {
+  try {
+    return new URL((request as { origin: string }).origin).hostname;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Per instrumentation: the config key of its outbound ignore hook, and how it names the host. */
+const OUTBOUND_GATES = new Map<string, { hook: string; hostOf: (request: unknown) => string | undefined }>([
+  ['@opentelemetry/instrumentation-http', { hook: 'ignoreOutgoingRequestHook', hostOf: httpRequestHost }],
+  ['@opentelemetry/instrumentation-undici', { hook: 'ignoreRequestHook', hostOf: undiciRequestHost }],
+]);
+
+/**
+ * Make the http and undici instrumentations skip every request to a host that
+ * is not allowed, or cannot be read: no auto span and no header. For an
+ * allowed host the caller's own ignore hook still decides. Returns an undo
+ * that puts the caller's hook back.
+ */
+function skipOffListHosts(instrumentations: readonly Instrumentation[], isAllowed: (host: string) => boolean): () => void {
+  const undo: Array<() => void> = [];
+  for (const instrumentation of instrumentations) {
+    const gate = OUTBOUND_GATES.get(instrumentation.instrumentationName);
+    if (gate === undefined) continue;
+    const own = (instrumentation.getConfig() as Record<string, unknown>)[gate.hook] as IgnoreHook | undefined;
+    const skip: IgnoreHook = (request) => {
+      const host = gate.hostOf(request);
+      if (host === undefined || !isAllowed(host)) return true;
+      return own?.(request) ?? false;
+    };
+    instrumentation.setConfig({ ...instrumentation.getConfig(), [gate.hook]: skip });
+    undo.push(() => instrumentation.setConfig({ ...instrumentation.getConfig(), [gate.hook]: own }));
+  }
+  return () => undo.forEach((restore) => restore());
+}
 
 function quietly(label: string, work: Promise<unknown>): Promise<void> {
   return work.then(
@@ -198,12 +252,13 @@ export function startTracing(service: string, options: StartTracingOptions = {})
 
   const contextManager = new AsyncLocalStorageContextManager().enable();
   const propagateHosts = [...propagationHostsFromEnv(env), ...(options.propagateHosts ?? [])];
+  const isAllowed = createHostAllowlist(propagateHosts);
   const registered = {
     context: context.setGlobalContextManager(contextManager),
     propagation: propagation.setGlobalPropagator(
       new AllowlistPropagator(
         new CompositePropagator({ propagators: [new W3CTraceContextPropagator(), new W3CBaggagePropagator()] }),
-        createHostAllowlist(propagateHosts),
+        isAllowed,
       ),
     ),
     trace: trace.setGlobalTracerProvider(provider),
@@ -225,7 +280,9 @@ export function startTracing(service: string, options: StartTracingOptions = {})
     );
   }
 
-  const unregister = registerInstrumentations({ instrumentations: options.instrumentations ?? [], tracerProvider: provider });
+  const instrumentations = options.instrumentations ?? [];
+  const restoreHooks = skipOffListHosts(instrumentations, isAllowed);
+  const unregister = registerInstrumentations({ instrumentations, tracerProvider: provider });
 
   const handle: Tracing = {
     state: {
@@ -238,6 +295,7 @@ export function startTracing(service: string, options: StartTracingOptions = {})
     forceFlush: () => quietly('forceFlush', provider.forceFlush()),
     shutdown: async () => {
       unregister();
+      restoreHooks();
       await quietly('shutdown', provider.shutdown());
       trace.disable();
       // Also disables contextManager: the API disables the manager it holds.

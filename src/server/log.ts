@@ -179,6 +179,44 @@ function flatValue(key: string, value: unknown, redact: RedactOptions): Scalar {
   }
 }
 
+/** A plain object or array, walked by key as it is. */
+function isPlainData(value: object): boolean {
+  if (Array.isArray(value)) return true;
+  const proto: unknown = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * The value JSON.stringify would write (toJSON honoured), parsed back.
+ * Undefined when there is none: a cycle throws, and so does parsing the
+ * undefined a toJSON() returning undefined leaves.
+ */
+function jsonForm(value: object): unknown {
+  try {
+    return JSON.parse(JSON.stringify(value)) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Key-based redaction for a value printed into a line (a message part, a
+ * bridged console argument), as flatValue applies to a field. A plain object
+ * or array is walked as is; an Error becomes {name, message, stack}, never its
+ * own properties (an AxiosError's config.headers, for one). Any other object
+ * (AxiosHeaders, a session or config class, Map, fetch Headers) is walked in
+ * its JSON form, so util.inspect and %o never see the original; a URL or Date
+ * becomes its string. One with no JSON form (a cycle) is walked as it is,
+ * cycles marked. A primitive is returned unchanged.
+ */
+function redactData(value: unknown, redact: RedactOptions): unknown {
+  if (value === null || typeof value !== 'object') return value;
+  const options = { ...redact, maxDepth: MAX_FIELD_DEPTH };
+  if (isPlainData(value) || value instanceof Error) return redactValue(value, options);
+  const json = jsonForm(value);
+  return redactValue(json === undefined ? value : json, options);
+}
+
 function nonNegativeMs(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? roundMs(value) : undefined;
 }
@@ -248,24 +286,27 @@ function toText(entry: Record<string, unknown>): string {
   return Object.entries(rest).reduce((line, [key, value]) => `${line} ${key}=${textValue(value)}`, head);
 }
 
-function stringifyArg(arg: unknown): string {
-  return typeof arg === 'string' ? arg : sanitizeLogValue(arg);
+/** A message part: a string as is, an Error as its message, anything else key-redacted like a field, on one line. */
+function stringifyArg(arg: unknown, redact: RedactOptions): string {
+  if (typeof arg === 'string') return arg;
+  return sanitizeLogValue(arg instanceof Error ? arg : redactData(arg, redact));
 }
 
 /** pino call shapes: (msg...), (obj, msg...), (err, msg...). */
-function splitArgs(args: unknown[]): { fields: Record<string, unknown>; message: string } {
+function splitArgs(args: unknown[], redact: RedactOptions): { fields: Record<string, unknown>; message: string } {
   const [first, ...rest] = args;
+  const text = (parts: unknown[]): string => parts.map((part) => stringifyArg(part, redact)).join(' ');
   if (first instanceof Error) {
-    return { fields: { err: first }, message: rest.length > 0 ? rest.map(stringifyArg).join(' ') : first.message };
+    return { fields: { err: first }, message: rest.length > 0 ? text(rest) : first.message };
   }
   if (first !== null && typeof first === 'object' && !Array.isArray(first)) {
-    return { fields: first as Record<string, unknown>, message: rest.map(stringifyArg).join(' ') };
+    return { fields: first as Record<string, unknown>, message: text(rest) };
   }
-  return { fields: {}, message: args.map(stringifyArg).join(' ') };
+  return { fields: {}, message: text(args) };
 }
 
 function render(core: Core, level: LogLevel, args: unknown[], bindings: Record<string, unknown>): string {
-  const { fields, message } = splitArgs(args);
+  const { fields, message } = splitArgs(args, core.redact);
   const entry = buildEntry(core, level, { ...bindings, ...fields }, message);
   return core.format === 'text' ? toText(entry) : JSON.stringify(entry);
 }
@@ -344,19 +385,6 @@ const LEADING_TIMESTAMP = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|
 const LEADING_TAG = /^\[([A-Za-z][^\[\]\r\n]{0,63})\]\s*/;
 const PRINTF = /%[sdifjoOc]/;
 
-/** A plain object or array: data to redact by key. A class instance keeps its own string form. */
-function isPlainData(value: unknown): boolean {
-  if (Array.isArray(value)) return true;
-  if (value === null || typeof value !== 'object') return false;
-  const proto: unknown = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
-/** Key-based redaction for a bridged argument, as flatValue applies to a logger field. */
-function redactData(value: unknown, redact: RedactOptions): unknown {
-  return isPlainData(value) ? redactValue(value, { ...redact, maxDepth: MAX_FIELD_DEPTH }) : value;
-}
-
 /** A string that is a (possibly pretty-printed) JSON document, re-emitted compact and redacted. */
 function compactJson(text: string, redact: RedactOptions): string {
   const trimmed = text.trim();
@@ -391,11 +419,13 @@ function consoleText(args: unknown[], redact: RedactOptions): string {
  * line each (log -> info). A leading `[TAG]` (spaces allowed, e.g. `[BROWSER
  * POOL]`) becomes the `tag` field, after dropping a leading `[ISO timestamp]`;
  * an Error argument becomes `err`, and a pretty-printed JSON string is
- * collapsed to one line. Objects, arrays, printf arguments and JSON strings are
- * key-redacted with the logger's own options (cookie, authorization, password
- * ...), as a logger field would be. Free text is covered only by the value
- * patterns (Bearer, JWT, ...), exactly as for msg. Returns an uninstall
- * function that restores the original methods.
+ * collapsed to one line. Every non-string argument, printf arguments included
+ * (plain objects, arrays, class instances such as AxiosHeaders, Errors), and
+ * every JSON string is key-redacted with the logger's own options (cookie,
+ * authorization, password ...), as a logger field would be. An Error prints as
+ * `name: message`, or as {name, message, stack} under %o/%O/%j/%s. Free text is
+ * covered only by the value patterns (Bearer, JWT, ...), exactly as for msg.
+ * Returns an uninstall function that restores the original methods.
  *
  * A console call made while a bridged line is being written (a sink that itself
  * logs to console) goes straight to the original method instead of recursing.

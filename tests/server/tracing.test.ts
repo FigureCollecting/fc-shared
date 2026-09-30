@@ -181,7 +181,8 @@ describe('startTracing without an endpoint (the no-op path)', () => {
   it('makes http and undici instrumentation skip every off-list host, keeps the caller\'s own ignore hook, and restores it on shutdown', async () => {
     const ownHttp = jest.fn((request: { path?: string | null }) => request.path === '/own-skip');
     const ownUndici = jest.fn((request: { path: string }) => request.path === '/own-skip');
-    const http = new HttpInstrumentation({ ignoreOutgoingRequestHook: ownHttp });
+    const incoming = (): boolean => false;
+    const http = new HttpInstrumentation({ ignoreOutgoingRequestHook: ownHttp, ignoreIncomingRequestHook: incoming });
     const undici = new UndiciInstrumentation({ ignoreRequestHook: ownUndici as never });
     const bare = new UndiciInstrumentation();
     const { probe, instrumentation: other } = probeInstrumentation();
@@ -218,12 +219,14 @@ describe('startTracing without an endpoint (the no-op path)', () => {
     const skipBare = bare.getConfig().ignoreRequestHook as (request: object) => boolean;
     expect([{ origin: 'http://localhost:1', path: '/' }, { origin: 'https://img.store-cdn.example', path: '/' }].map(skipBare))
       .toEqual([false, true]);
-    // Only http and undici are touched.
+    // Only the outbound hook of http and undici is touched.
+    expect(http.getConfig().ignoreIncomingRequestHook).toBe(incoming);
     expect(probe.setConfig).not.toHaveBeenCalled();
 
     await active.shutdown();
     active = undefined;
     expect(http.getConfig().ignoreOutgoingRequestHook).toBe(ownHttp);
+    expect(http.getConfig().ignoreIncomingRequestHook).toBe(incoming);
     expect(undici.getConfig().ignoreRequestHook).toBe(ownUndici);
     expect(bare.getConfig().ignoreRequestHook).toBeUndefined();
   });
@@ -313,10 +316,8 @@ describe('startTracing with an exporter', () => {
       expect(sockets.length).toBeGreaterThan(0);
       // The flush gives up at the deadline. The OTLP call has the SAME deadline, so it is over by
       // then and shutdown has nothing left to wait for; a longer exporter deadline would hold it.
-      expect({ flushMs: Math.round(flushMs), shutdownMs: Math.round(shutdownMs) }).toEqual({
-        flushMs: expect.toBeWithin(0, DEADLINE_MS + SLACK_MS),
-        shutdownMs: expect.toBeWithin(0, SLACK_MS),
-      });
+      expect(flushMs).toBeLessThan(DEADLINE_MS + SLACK_MS);
+      expect(shutdownMs).toBeLessThan(SLACK_MS);
     } finally {
       sockets.forEach((socket) => socket.destroy());
       await new Promise((resolve) => blackHole.close(resolve));
