@@ -56,7 +56,18 @@ describe('log-shape.schema.json', () => {
     expectValidLine({ ...noSpan, level: 'error', code: 'internal', err: { type: 'Error', message: 'x' }, queue_ms: 3 });
   });
 
+  it('accepts item.coalesced with the winner\'s trace id, and app.enrichment (plan-v2 U1 scope)', () => {
+    const winner = 'c'.repeat(32);
+    expectValidLine({ ...EXAMPLE_JOB_END, event: 'item.coalesced', winner_trace_id: winner });
+    // The winner's trace id is optional: the first enqueue may have carried no traceparent.
+    expectValidLine({ ...EXAMPLE_JOB_END, event: 'item.coalesced' });
+    expectValidLine({ ...EXAMPLE_JOB_END, event: 'app.enrichment', winner_trace_id: winner });
+  });
+
   const rejects: Array<[string, Record<string, unknown>]> = [
+    ['a winner_trace_id that is not a trace id', { ...EXAMPLE_JOB_END, event: 'app.log', winner_trace_id: 'not-a-trace-id' }],
+    ['a zeroed winner_trace_id', { ...EXAMPLE_JOB_END, event: 'app.log', winner_trace_id: '0'.repeat(32) }],
+    ['an uppercase winner_trace_id', { ...EXAMPLE_JOB_END, event: 'app.log', winner_trace_id: TRACE_ID.toUpperCase() }],
     ['a query string in call', { ...EXAMPLE_RPC_IN, call: 'POST /ingest/scrape?token=1' }],
     ['a zeroed trace_id', { ...EXAMPLE_RPC_IN, trace_id: '0'.repeat(32) }],
     ['a zeroed span_id', { ...EXAMPLE_RPC_IN, span_id: '0'.repeat(16) }],

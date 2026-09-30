@@ -9,6 +9,7 @@ import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
 import { InMemorySpanExporter, type ReadableSpan } from '@opentelemetry/sdk-trace';
 import {
   DROPPED_ATTRIBUTE_KEYS,
+  DROPPED_ATTRIBUTE_PREFIXES,
   RedactingSpanExporter,
   URL_ATTRIBUTE_KEYS,
   redactSpanAttributes,
@@ -32,7 +33,7 @@ describe('stripUrl', () => {
 });
 
 describe('redactSpanAttributes', () => {
-  it('strips queries from every URL-bearing key, drops url.query, and keeps the rest', () => {
+  it('strips queries from every URL-bearing key, drops url.query and every header, and keeps the rest', () => {
     const input: Attributes = {
       'url.full': 'https://cdn.store.example/i.jpg?X-Amz-Signature=deadbeef',
       'http.url': 'http://old.semconv.example/p?session=1',
@@ -42,6 +43,11 @@ describe('redactSpanAttributes', () => {
       'url.query': '?X-Amz-Signature=deadbeef',
       'url.path': '/i.jpg',
       'http.request.header.authorization': 'Bearer abcdefghijklmnop',
+      'http.request.header.referer': ['https://x.example/a?sig=SECRET'],
+      'http.request.header.x-client-ip': ['203.0.113.7'],
+      'http.response.header.location': ['https://cdn.example/o?X-Amz-Signature=SECRET'],
+      'http.request.method': 'GET',
+      'fc.http.request.header.note': 'kept: not a header attribute',
       'fc.note': 'token in text Bearer abcdefghijklmnop',
       'http.response.status_code': 200,
       'fc.flags': ['a?b', 'Bearer abcdefghijklmnop'],
@@ -54,7 +60,8 @@ describe('redactSpanAttributes', () => {
       'url.original': 'https://o.example/',
       'db.connection_string': 'postgresql://h/db',
       'url.path': '/i.jpg',
-      'http.request.header.authorization': '[REDACTED]',
+      'http.request.method': 'GET',
+      'fc.http.request.header.note': 'kept: not a header attribute',
       'fc.note': 'token in text [REDACTED]',
       'http.response.status_code': 200,
       'fc.flags': ['a?b', '[REDACTED]'],
@@ -71,6 +78,7 @@ describe('redactSpanAttributes', () => {
       expect.arrayContaining(['url.full', 'http.url', 'http.target', 'url.original', 'db.connection_string']),
     );
     expect(DROPPED_ATTRIBUTE_KEYS).toEqual(['url.query']);
+    expect(DROPPED_ATTRIBUTE_PREFIXES).toEqual(['http.request.header.', 'http.response.header.']);
   });
 });
 

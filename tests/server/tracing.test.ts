@@ -230,6 +230,28 @@ describe('startTracing without an endpoint (the no-op path)', () => {
     expect(undici.getConfig().ignoreRequestHook).toBe(ownUndici);
     expect(bare.getConfig().ignoreRequestHook).toBeUndefined();
   });
+
+  it('gates instrumentations passed in a nested array, the shape the OpenTelemetry docs use', async () => {
+    const http = new HttpInstrumentation();
+    const undici = new UndiciInstrumentation();
+    const { probe, instrumentation: other } = probeInstrumentation();
+    active = startTracing('scraper', { env: {}, instrumentations: [[http, undici], other] });
+
+    const skipHttp = http.getConfig().ignoreOutgoingRequestHook as ((request: object) => boolean) | undefined;
+    const skipUndici = undici.getConfig().ignoreRequestHook as ((request: object) => boolean) | undefined;
+    expect([
+      skipHttp?.({ hostname: 'img.store-cdn.example', path: '/' }),
+      skipHttp?.({ hostname: 'scraper.fc.svc', path: '/' }),
+      skipUndici?.({ origin: 'https://img.store-cdn.example', path: '/' }),
+      skipUndici?.({ origin: 'http://scraper.fc.svc:3050', path: '/' }),
+    ]).toEqual([true, false, true, false]);
+    expect(probe.enable).toHaveBeenCalledTimes(1);
+
+    await active.shutdown();
+    active = undefined;
+    expect(http.getConfig().ignoreOutgoingRequestHook).toBeUndefined();
+    expect(undici.getConfig().ignoreRequestHook).toBeUndefined();
+  });
 });
 
 describe('startTracing with an exporter', () => {
@@ -248,10 +270,7 @@ describe('startTracing with an exporter', () => {
     await active.forceFlush();
 
     const [span] = exporter.getFinishedSpans();
-    expect(span.attributes).toEqual({
-      'url.full': 'https://img.store-cdn.example/a.jpg',
-      'http.request.header.cookie': '[REDACTED]',
-    });
+    expect(span.attributes).toEqual({ 'url.full': 'https://img.store-cdn.example/a.jpg' });
     expect(span.resource.attributes['service.name']).toBe('ingest-server');
     expect(span.resource.attributes['service.version']).toBe('1.9.0');
   });

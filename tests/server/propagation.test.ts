@@ -85,6 +85,23 @@ describe('createHostAllowlist', () => {
     expect(custom('ingest-server.fc')).toBe(false);
   });
 
+  it.each([
+    'scraper.fc.svc:3050',
+    'http://scraper.fc.svc',
+    'https://Scraper.FC.svc:443/ingest',
+    ' scraper.fc.svc. ',
+  ])('reads the host of an entry written as %s', (entry) => {
+    const matcher = createHostAllowlist([entry]);
+    expect(matcher('scraper.fc.svc')).toBe(true);
+    expect(matcher('img.store-cdn.example')).toBe(false);
+  });
+
+  it('reads the suffix of a wildcard entry written with a scheme or port', () => {
+    const matcher = createHostAllowlist(['http://*.svc:8080']);
+    expect(matcher('scraper.fc.svc')).toBe(true);
+    expect(matcher('svc')).toBe(false);
+  });
+
   it('never lets a bare wildcard ("*", "*.", "*..") allow a host', () => {
     for (const entries of [['*.'], ['*..'], ['*'], propagationHostsFromEnv({ OTEL_PROPAGATION_ALLOWLIST: '*.,*..,*' })]) {
       const matcher = createHostAllowlist(entries);
@@ -100,6 +117,8 @@ describe('createHostAllowlist', () => {
     expect(propagationHostsFromEnv({ OTEL_PROPAGATION_ALLOWLIST: 'ingest-server.fc.svc, *.internal,,' })).toEqual([
       'ingest-server.fc.svc', '*.internal',
     ]);
+    // One entry is a list too, not a reason to fall back to the defaults.
+    expect(propagationHostsFromEnv({ OTEL_PROPAGATION_ALLOWLIST: 'scraper.fc.svc' })).toEqual(['scraper.fc.svc']);
     expect(propagationHostsFromEnv({})).toEqual(['*.svc.cluster.local', '*.svc', 'localhost']);
     expect(propagationHostsFromEnv({ OTEL_PROPAGATION_ALLOWLIST: ' , ' })).toEqual(['*.svc.cluster.local', '*.svc', 'localhost']);
     // The pre-plan name is not read.
@@ -290,8 +309,10 @@ describe('AllowlistPropagator with real node:http and fetch (child process, buil
       const { UndiciInstrumentation } = require('@opentelemetry/instrumentation-undici');
       const { InMemorySpanExporter } = require('@opentelemetry/sdk-trace');
       const exporter = new InMemorySpanExporter();
+      // Nested, as the OpenTelemetry docs pass getNodeAutoInstrumentations() and as a
+      // service's src/instrument.mjs will; the flat shape is covered in-process above.
       const tracing = startTracing('propagation-probe', {
-        env: {}, exporter, instrumentations: [new HttpInstrumentation(), new UndiciInstrumentation()],
+        env: {}, exporter, instrumentations: [[new HttpInstrumentation(), new UndiciInstrumentation()]],
       });
       const http = require('node:http');
       const received = {};

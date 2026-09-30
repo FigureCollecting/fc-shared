@@ -7,7 +7,10 @@
  */
 import { context, trace, ROOT_CONTEXT } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
-import { AxiosError, AxiosHeaders } from 'axios';
+import * as http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { inspect } from 'node:util';
+import axios, { AxiosError, AxiosHeaders } from 'axios';
 import {
   RESERVED_LOG_KEYS,
   createLogger,
@@ -437,6 +440,8 @@ describe('every event kind validates against the published schema', () => {
     ['ingest.reject', { code: 'invalid_argument', reason: 'no source' }],
     ['decision', { allowed: true }],
     ['app.console', { tag: 'CAPTURE' }],
+    ['item.coalesced', { site: 'orzgk', winner_trace_id: 'a'.repeat(32) }],
+    ['app.enrichment', { site: 'orzgk' }],
     ['app.scrape_queue.depth', { depth: 4 }],
   ];
 
@@ -617,8 +622,8 @@ describe('console bridge', () => {
       "login { user: 'ross', cookie: '[REDACTED]', authorization: '[REDACTED]' }",
       'cfg {"store":"orzgk","apiKey":"[REDACTED]"}',
       'request headers {"Cookie":"[REDACTED]","Authorization":"[REDACTED]"}',
-      // fetch Headers and Map serialise to {}: nothing to show, nothing leaked.
-      'headers {}',
+      // fetch Headers hides itself from util.inspect: its class name. A Map serialises to {}.
+      "headers '[Headers]'",
       'jar {}',
     ]);
     // An Error is {name, message, stack} with secret-shaped values masked, never its own properties.
@@ -629,7 +634,7 @@ describe('console bridge', () => {
     expect(msgs.slice(11)).toEqual(['at 2026-09-29T12:00:00.000Z', 'open https://img.store-cdn.example/b.jpg']);
   });
 
-  it('walks an instance with no JSON form (a cycle, a toJSON returning undefined), cycles marked', () => {
+  it('marks a cycle, and prints an instance whose toJSON gives nothing as its class name', () => {
     class Circular {
       name = 'pool';
       cookie = 'sid=CIRCULAR-COOKIE';
@@ -652,7 +657,7 @@ describe('console bridge', () => {
     expect(parsed().map((line) => line.msg)).toEqual([
       'pool {"name":"pool","cookie":"[REDACTED]","self":"[circular]"}',
       "{ name: 'pool', cookie: '[REDACTED]', self: '[circular]' }",
-      'opaque {"cookie":"[REDACTED]"}',
+      'opaque [Opaque]',
     ]);
   });
 
@@ -758,5 +763,403 @@ describe('console bridge', () => {
     uninstall();
     expect(parsed()[0]).toMatchObject({ trace_id: TRACE_ID, span_id: SPAN_ID });
     expect(trace.getActiveSpan()).toBeUndefined();
+  });
+});
+
+/** A console stand-in whose methods record nothing: every call goes to the bridge. */
+function bridged(extra: Record<string, unknown> = {}) {
+  const capture = captureSink();
+  const log = createLogger({ ...BASE, sink: capture.sink, ...extra });
+  const noop = (..._args: unknown[]): void => undefined;
+  const target = { log: noop, info: noop, warn: noop, error: noop, debug: noop };
+  const uninstall = installConsoleBridge(log, target);
+  return { log, target, uninstall, ...capture, msgs: () => capture.parsed().map((line) => line.msg) };
+}
+
+describe('URLs in log output lose their query, fragment and userinfo (plan-v2 propagation_and_redaction)', () => {
+  it('prints a URL field holding ?sig=SECRET without the query (plan-v2 U1 acceptance)', () => {
+    const { log, lines, parsed } = logger();
+    log.info({ url: 'https://x.example/a/b?sig=SECRET#f' }, 'fetch');
+    const [line] = parsed();
+    expect(line.url).toBe('https://x.example/a/b');
+    expect(lines[0]).not.toMatch(/\?|SECRET|#f/);
+    expectValidLine(line);
+  });
+
+  it.each([
+    ['a signed image URL', 'https://img.store-cdn.example/a.jpg?X-Amz-Signature=SECRET&exp=1', 'https://img.store-cdn.example/a.jpg'],
+    ['userinfo', 'https://user:SECRET@h.example:8443/x', 'https://h.example:8443/x'],
+    ['userinfo holding an @', 'https://u:SEC@RET@h.example/x', 'https://h.example/x'],
+    ['a connection string', 'postgresql://app:SECRET@pg-spine-rw.data.svc:5432/spine?sslmode=require', 'postgresql://pg-spine-rw.data.svc:5432/spine'],
+    ['an upper-case scheme', 'HTTPS://X.EXAMPLE/A?SIG=SECRET', 'HTTPS://X.EXAMPLE/A'],
+    ['a fragment', 'https://x.example/p#SECRET', 'https://x.example/p'],
+    ['a host with no path', 'https://x.example?k=SECRET', 'https://x.example'],
+    ['an @ in the path, not userinfo', 'https://x.example/u/@ross?k=SECRET', 'https://x.example/u/@ross'],
+    ['a path with a query', '/login?token=SECRET', '/login'],
+    ['a protocol-relative URL', '//cdn.example/i.jpg?sig=SECRET', '//cdn.example/i.jpg'],
+    ['a URL inside text', 'retry https://x.example/a?sig=SECRET in 5s', 'retry https://x.example/a in 5s'],
+    ['a URL glued to a word', 'src=https://x.example/a?sig=SECRET', 'src=https://x.example/a'],
+    ['two URLs', 'from https://a.example/?k=SECRET to http://b.example/c#SECRET', 'from https://a.example/ to http://b.example/c'],
+    ['a quoted URL', "open 'https://x.example/a?sig=SECRET' now", "open 'https://x.example/a' now"],
+  ])('strips %s', (_label, value, expected) => {
+    const { log, lines, parsed } = logger();
+    log.info({ link: value });
+    expect(parsed()[0].link).toBe(expected);
+    expect(lines[0]).not.toContain('SECRET');
+  });
+
+  it.each([
+    ['a URL with nothing to strip keeps its exact text', 'https://X.example'],
+    ['a file URL', 'file:///app/dist/server.mjs:10:5'],
+    ['a question in text', 'why? because'],
+    ['a word with a question mark', 'a?b'],
+    ['a path followed by text', '/a b?c'],
+  ])('leaves %s alone', (_label, value) => {
+    const { log, parsed } = logger();
+    log.info({ link: value });
+    expect(parsed()[0].link).toBe(value);
+  });
+
+  it('strips URLs inside object fields, arrays and URL instances', () => {
+    const { log, lines, parsed } = logger();
+    log.info({
+      page: { src: 'https://img.example/a.jpg?sig=SECRET', thumbs: ['https://img.example/t.jpg?sig=SECRET'] },
+      imageUrl: new URL('https://img.example/b.jpg?sig=SECRET'),
+    });
+    const [line] = parsed();
+    expect(line.page).toBe('{"src":"https://img.example/a.jpg","thumbs":["https://img.example/t.jpg"]}');
+    expect(line.image_url).toBe('https://img.example/b.jpg');
+    expect(lines[0]).not.toContain('SECRET');
+  });
+
+  it('strips URLs in the message, its parts and err.message', () => {
+    const { log, lines, parsed } = logger();
+    log.info('fetching https://x.example/a?sig=SECRET1');
+    log.info('open', new URL('https://x.example/b?sig=SECRET2'), 'https://x.example/c?sig=SECRET3');
+    log.error(new Error('request to https://x.example/d?token=SECRET4 failed'));
+    log.error({ err: '/e?token=SECRET5' }, 'failed');
+    const out = parsed();
+    expect(out.map((line) => line.msg)).toEqual([
+      'fetching https://x.example/a',
+      'open https://x.example/b https://x.example/c',
+      'request to https://x.example/d failed',
+      'failed',
+    ]);
+    expect(out[2].err).toEqual({ type: 'Error', message: 'request to https://x.example/d failed' });
+    expect(out[3].err).toEqual({ type: 'string', message: '/e' });
+    expect(lines.join('\n')).not.toContain('SECRET');
+  });
+
+  it('strips URLs in every bridged argument, printf included', () => {
+    const { target, uninstall, lines, msgs } = bridged();
+    target.log('open', new URL('https://x.example/a?sig=SECRET1'));
+    target.log('fetch %s', 'https://x.example/b?sig=SECRET2');
+    target.log('[FETCH] https://x.example/c?sig=SECRET3');
+    target.log('%o', { url: 'https://x.example/d?sig=SECRET4' });
+    target.log('GET', '/login?token=SECRET5');
+    uninstall();
+    expect(msgs()).toEqual([
+      'open https://x.example/a',
+      'fetch https://x.example/b',
+      'https://x.example/c',
+      "{ url: 'https://x.example/d' }",
+      'GET /login',
+    ]);
+    expect(lines.join('\n')).not.toContain('SECRET');
+  });
+
+  it('leaves nothing secret of a real failed axios request: no query, no body password, no header', async () => {
+    const server = http.createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        res.statusCode = 403;
+        res.end('no');
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/login?access_token=ACCESS-SECRET`;
+    const err = (await axios
+      .post(url, { username: 'ross', password: 'hunter2' }, { headers: { Authorization: 'Bearer abcdefghijklmnop' } })
+      .catch((error: unknown) => error)) as AxiosError;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    expect(err).toBeInstanceOf(AxiosError);
+    class Attempt {
+      site = 'orzgk';
+      constructor(public error: unknown) {}
+    }
+
+    const { log, target, uninstall, lines, parsed } = bridged();
+    log.warn({ config: err.config }, 'retry');
+    log.warn('attempt', new Attempt(err));
+    target.error('login failed', err);
+    target.error('login failed %o', err);
+    target.error('attempt', new Attempt(err));
+    target.error('retry', { config: err.config });
+    uninstall();
+    expect(lines).toHaveLength(6);
+    expect(lines.join('\n')).not.toMatch(/hunter2|ACCESS-SECRET|abcdefghijklmnop/);
+    const config = JSON.parse(parsed()[0].config as string) as { url: string; data: string };
+    expect(config.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/login$/);
+    expect(JSON.parse(config.data)).toEqual({ username: 'ross', password: '[REDACTED]' });
+  });
+});
+
+describe('JSON strings are key-redacted wherever they are printed', () => {
+  it('in a field, a message part and a JSON string inside another', () => {
+    const { log, lines, parsed } = logger();
+    log.info({ body: '{"password":"hunter2","site":"orzgk"}' }, 'resp');
+    log.info('resp', '{"token":"zzz-tok"}');
+    log.info({ body: JSON.stringify({ inner: JSON.stringify({ password: 'hunter2' }) }) });
+    log.info({ pretty: JSON.stringify({ a: 1, b: [1, 2] }, null, 2) });
+    log.info({ list: '[{"cookie":"sid=1"}]', broken: '{"password":"hunter2"' });
+    const out = parsed();
+    expect(out[0].body).toBe('{"password":"[REDACTED]","site":"orzgk"}');
+    expect(out[1].msg).toBe('resp {"token":"[REDACTED]"}');
+    expect(out[2].body).toBe(JSON.stringify({ inner: JSON.stringify({ password: '[REDACTED]' }) }));
+    expect(out[3].pretty).toBe('{"a":1,"b":[1,2]}');
+    expect(out[4].list).toBe('[{"cookie":"[REDACTED]"}]');
+    // Not JSON: only the value patterns apply, exactly as for any text.
+    expect(out[4].broken).toBe('{"password":"hunter2"');
+    expect(lines.slice(0, 4).join('\n')).not.toMatch(/hunter2|zzz-tok|sid=1/);
+  });
+
+  it('in printf arguments and after a printf format (console bridge)', () => {
+    const { target, uninstall, lines, msgs } = bridged();
+    target.log('resp %s', JSON.stringify({ token: 'zzz-tok', password: 'hunter2' }));
+    target.log('status %d', 403, '{"password":"hunter2"}');
+    target.log('body %j', '{"password":"hunter2"}');
+    uninstall();
+    expect(msgs()).toEqual([
+      'resp {"token":"[REDACTED]","password":"[REDACTED]"}',
+      'status 403 {"password":"[REDACTED]"}',
+      'body "{\\"password\\":\\"[REDACTED]\\"}"',
+    ]);
+    expect(lines.join('\n')).not.toMatch(/hunter2|zzz-tok/);
+  });
+
+  it('stops parsing JSON held in strings four levels down and prints a marker, never the text', () => {
+    let doc: unknown = { password: 'hunter2' };
+    for (let level = 0; level < 4; level += 1) doc = { s: JSON.stringify(doc) };
+    const { log, lines, parsed } = logger();
+    log.info({ body: JSON.stringify(doc) });
+    let text = parsed()[0].body as string;
+    for (let level = 0; level < 4; level += 1) text = (JSON.parse(text) as { s: string }).s;
+    expect(text).toBe('[truncated:max-depth]');
+    expect(lines[0]).not.toContain('hunter2');
+  });
+});
+
+describe('an object that hides itself from util.inspect prints as its class name', () => {
+  class Credential {
+    constructor(public value: string) {}
+    [inspect.custom](): string {
+      return 'Credential<hidden>';
+    }
+  }
+  class Holder {
+    constructor(public inner: unknown) {}
+  }
+
+  it('in every argument position and as a field, at the top and nested', () => {
+    const cred = new Credential('hunter2');
+    const { log, target, uninstall, lines, parsed, msgs } = bridged();
+    target.log('using %o', cred);
+    target.log('using %s', cred);
+    target.log('using', cred);
+    target.log('%o', { cred });
+    target.log('held', new Holder(cred));
+    log.info('part', cred);
+    log.info({ cred }, 'field');
+    uninstall();
+    expect(lines.join('\n')).not.toContain('hunter2');
+    expect(msgs()).toEqual([
+      "using '[Credential]'",
+      'using [Credential]',
+      'using [Credential]',
+      "{ cred: '[Credential]' }",
+      'held {"inner":"[Credential]"}',
+      'part [Credential]',
+      'field',
+    ]);
+    expect(parsed()[6].cred).toBe('[Credential]');
+  });
+
+  it('names one with no class "object", and honours a toJSON over util.inspect.custom', () => {
+    const bare = Object.assign(Object.create(null) as object, { value: 'hunter2', [inspect.custom]: () => 'bare' });
+    const anonymous = new (class {
+      value = 'hunter2';
+      [inspect.custom](): string {
+        return 'anonymous';
+      }
+    })();
+    const shown = new (class Token {
+      value = 'hunter2';
+      [inspect.custom](): string {
+        return 'Token<hidden>';
+      }
+      toJSON(): object {
+        return { kind: 'token' };
+      }
+    })();
+    const { target, uninstall, lines, msgs } = bridged();
+    target.log('bare', bare);
+    target.log('anonymous', anonymous);
+    target.log('shown', shown);
+    uninstall();
+    expect(lines.join('\n')).not.toContain('hunter2');
+    expect(msgs()).toEqual(['bare [object]', 'anonymous [object]', 'shown {"kind":"token"}']);
+  });
+});
+
+describe('printing a value never throws and stays bounded', () => {
+  class Getter {
+    cookie = 'sid=S3CRET';
+    constructor() {
+      Object.defineProperty(this, 'boom', {
+        enumerable: true,
+        get() {
+          throw new Error('getter threw');
+        },
+      });
+    }
+  }
+
+  it('prints an object it cannot read as [unserializable], per value', () => {
+    const { log, target, uninstall, parsed, msgs } = bridged();
+    expect(() => {
+      target.log('x', new Getter());
+      target.log('%o', new Getter());
+      log.info('x', new Getter());
+      log.info({ f: new Getter(), ok: 1 }, 'field');
+    }).not.toThrow();
+    uninstall();
+    expect(msgs()).toEqual(['x [unserializable]', "'[unserializable]'", 'x [unserializable]', 'field']);
+    expect(parsed()[3]).toMatchObject({ f: '[unserializable]', ok: 1 });
+  });
+
+  it('writes a line saying [unserializable] when the call itself cannot be read (a revoked Proxy)', () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    const { log, target, uninstall, parsed } = bridged();
+    expect(() => {
+      log.info(proxy);
+      log.warn('x', proxy);
+      log.error({ p: proxy }, 'field');
+      target.log(proxy);
+      target.log('%o', proxy);
+    }).not.toThrow();
+    uninstall();
+    const out = parsed();
+    expect(out.map((line) => [line.level, line.msg])).toEqual([
+      ['info', '[unserializable]'],
+      ['warn', '[unserializable]'],
+      ['error', 'field'],
+      ['info', '[unserializable]'],
+      ['info', '[unserializable]'],
+    ]);
+    expect(out[2].p).toBe('[unserializable]');
+    out.forEach(expectValidLine);
+  });
+
+  it('prints binary data as [binary] wherever it appears, as a field already does', () => {
+    const { log, target, uninstall, parsed, msgs } = bridged();
+    log.info({ body: Buffer.from('sid=hunter2') }, 'field');
+    log.info('body', Buffer.from('Cookie: sid=hunter2'));
+    target.log('body', new TextEncoder().encode('sid=hunter2'));
+    target.log('body %o', Buffer.from('sid=hunter2'));
+    target.log('raw', new ArrayBuffer(4));
+    target.log('held', new (class Upload {
+      name = 'a.jpg';
+      data = Buffer.from('sid=hunter2');
+    })());
+    uninstall();
+    expect(parsed()[0].body).toBe('[binary]');
+    expect(msgs()).toEqual([
+      'field',
+      'body [binary]',
+      'body [binary]',
+      "body '[binary]'",
+      'raw [binary]',
+      'held {"name":"a.jpg","data":"[binary]"}',
+    ]);
+  });
+
+  it('prints an Error held by another object as {name, message, stack}, never its own properties', () => {
+    class HttpErr extends Error {
+      headers = { cookie: 'sid=S3CRET' };
+      constructor() {
+        super('403 from https://x.example/a?sig=S3CRET');
+        this.name = 'HttpErr';
+      }
+    }
+    class Attempt {
+      site = 'orzgk';
+      cause = new HttpErr();
+    }
+    const { log, target, uninstall, lines, parsed, msgs } = bridged();
+    target.log('attempt', new Attempt());
+    log.info({ attempt: new Attempt() });
+    uninstall();
+    expect(lines.join('\n')).not.toMatch(/S3CRET|headers/);
+    const head = '{"site":"orzgk","cause":{"name":"HttpErr","message":"403 from https://x.example/a","stack":"';
+    expect(msgs()[0]).toMatch(new RegExp(`^attempt ${head.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    expect(parsed()[1].attempt as string).toMatch(new RegExp(`^${head.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  });
+
+  it('prints bigint and symbol values held by an object, as a field does', () => {
+    const { target, uninstall, msgs } = bridged();
+    target.log('big', new (class Big {
+      n = BigInt(10);
+      password = 'hunter2';
+      tag = Symbol('t');
+    })());
+    target.log('list', [() => 1, new URL('https://x.example/a?sig=1')]);
+    uninstall();
+    expect(msgs()).toEqual([
+      'big {"n":"10n","password":"[REDACTED]","tag":"[symbol]"}',
+      'list ["[function]","https://x.example/a"]',
+    ]);
+  });
+
+  it('keeps 100 entries of an array or object, the last one counting the rest, and never serialises the rest', () => {
+    const serialised: number[] = [];
+    const rows = Array.from({ length: 1000 }, (_, index) => ({
+      toJSON: () => {
+        serialised.push(index);
+        return index;
+      },
+    }));
+    const hundred = Array.from({ length: 100 }, (_, index) => index);
+    const keys = (count: number) => Object.fromEntries(Array.from({ length: count }, (_, index) => [`a${index}`, 0]));
+    const { log, target, uninstall, parsed, msgs } = bridged();
+    target.log('rows', rows);
+    target.log('hundred', hundred);
+    target.log('wide', keys(150));
+    target.log('keys', keys(100));
+    log.info({ page: new (class Page {
+      rows = rows;
+    })() });
+    uninstall();
+    expect(serialised).toEqual([...Array.from({ length: 99 }, (_, index) => index), ...Array.from({ length: 99 }, (_, index) => index)]);
+    const first99 = Array.from({ length: 99 }, (_, index) => index);
+    expect(msgs().slice(0, 4)).toEqual([
+      `rows ${JSON.stringify([...first99, '[truncated:901 more]'])}`,
+      `hundred ${JSON.stringify(hundred)}`,
+      `wide ${JSON.stringify({ ...keys(99), '[truncated]': '51 more' })}`,
+      `keys ${JSON.stringify(keys(100))}`,
+    ]);
+    expect(parsed()[4].page).toBe(JSON.stringify({ rows: [...first99, '[truncated:901 more]'] }).slice(0, 1000) + '...[truncated]');
+  });
+
+  it('never reads an object past the fourth level', () => {
+    const deep = { a: { b: { c: { d: { get e(): never {
+      throw new Error('read past the depth limit');
+    } } } } } };
+    const { log, target, uninstall, parsed, msgs } = bridged();
+    target.log('deep', deep);
+    log.info({ deep });
+    uninstall();
+    expect(msgs()[0]).toBe('deep {"a":{"b":{"c":{"d":"[truncated:max-depth]"}}}}');
+    expect(parsed()[1].deep).toBe('{"a":{"b":{"c":{"d":"[truncated:max-depth]"}}}}');
   });
 });
