@@ -5,7 +5,15 @@
  * link and fc.run_id pointing back at the run. Spans are flushed before
  * runJob returns, because a CronJob process exits right after.
  */
-import { SpanKind, SpanStatusCode, context, trace, type TracerProvider } from '@opentelemetry/api';
+import {
+  INVALID_SPAN_CONTEXT,
+  ROOT_CONTEXT,
+  SpanKind,
+  SpanStatusCode,
+  context,
+  trace,
+  type TracerProvider,
+} from '@opentelemetry/api';
 import { InMemorySpanExporter, type ReadableSpan } from '@opentelemetry/sdk-trace';
 import { createLogger } from '../../src/server/log';
 import { currentTraceparent, runJob, withTraceparent } from '../../src/server/job';
@@ -103,6 +111,14 @@ describe('runJob', () => {
     expect(runSpan.attributes['k8s.job.name']).toBeUndefined();
   });
 
+  it('treats a blank JOB_NAME as unset', async () => {
+    const { logger, parsed } = jobLogger({});
+    await runJob('local-run', () => 'done', { logger, env: { JOB_NAME: '   ' } });
+    expect(parsed().map((line) => line.job)).toEqual(['local-run', 'local-run']);
+    const [runSpan] = exporter.getFinishedSpans();
+    expect(runSpan.attributes['k8s.job.name']).toBeUndefined();
+  });
+
   it('gives every item its own root trace, linked to the run and tagged with fc.run_id', async () => {
     const { logger, parsed } = jobLogger();
     const itemIds: string[] = [];
@@ -125,6 +141,7 @@ describe('runJob', () => {
     expect(new Set([runId, ...itemIds]).size).toBe(3);
     for (const item of items) {
       expect(item.parentSpanContext).toBeUndefined();
+      expect(item.status.code).toBe(SpanStatusCode.OK);
       expect(item.kind).toBe(SpanKind.PRODUCER);
       expect(item.attributes['fc.run_id']).toBe(runId);
       expect(item.links).toHaveLength(1);
@@ -215,6 +232,27 @@ describe('traceparent helpers for queues', () => {
       return { value, ids: span.spanContext() };
     });
     expect(tp.value).toBe(`00-${tp.ids.traceId}-${tp.ids.spanId}-01`);
+  });
+
+  it('currentTraceparent is undefined under an all-zero span context, never an all-zero id', () => {
+    const value = context.with(trace.setSpan(ROOT_CONTEXT, trace.wrapSpanContext(INVALID_SPAN_CONTEXT)), () =>
+      currentTraceparent(),
+    );
+    expect(value).toBeUndefined();
+  });
+
+  it('withTraceparent accepts a stored value with surrounding whitespace', () => {
+    const traceId = withTraceparent(`  ${TRACEPARENT}\n`, () => trace.getActiveSpan()?.spanContext().traceId);
+    expect(traceId).toBe(TRACE_ID);
+  });
+
+  it('withTraceparent with a bad value also drops the span active at the call site', () => {
+    const seen = trace.getTracer('q').startActiveSpan('ambient', (span) => {
+      const inner = withTraceparent('garbage', () => trace.getActiveSpan());
+      span.end();
+      return inner;
+    });
+    expect(seen).toBeUndefined();
   });
 
   it('withTraceparent restores the stored parent so work continues the same trace', () => {

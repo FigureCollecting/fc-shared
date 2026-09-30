@@ -135,6 +135,31 @@ describe('server log line shape', () => {
     expect(line.queue_ms).toBe(12.3);
   });
 
+  it('drops negative timings, cuts call at a fragment too, and keeps peer on one line', () => {
+    const { log, parsed } = logger();
+    log.info({ event: 'app.timing', call: 'GET /a#frag', duration_ms: -5, queue_ms: -1, peer: 'forged\npeer' });
+    const [line] = parsed();
+    expect(line.call).toBe('GET /a');
+    expect(line).not.toHaveProperty('duration_ms');
+    expect(line).not.toHaveProperty('queue_ms');
+    expect(line.peer).toBe('forged peer');
+    expectValidLine(line);
+  });
+
+  it('logs an array first argument as message text, not as fields', () => {
+    const { log, parsed } = logger();
+    log.info(['a', 'b'], 'x');
+    const [line] = parsed();
+    expect(line.msg).toBe('["a","b"] x');
+    expect(line).not.toHaveProperty('f_0');
+  });
+
+  it('walks an object field at most four levels deep', () => {
+    const { log, parsed } = logger();
+    log.info({ deep: { a: { b: { c: { d: { e: 1 } } } } } });
+    expect(parsed()[0].deep).toBe('{"a":{"b":{"c":{"d":"[truncated:max-depth]"}}}}');
+  });
+
   it('maps camelCase reserved spellings onto the reserved keys', () => {
     const { log, parsed } = logger();
     log.info({ event: 'job.end', code: 'ok', durationMs: 671000, queueMs: 5 });
@@ -209,9 +234,11 @@ describe('server log line shape', () => {
     const { log, parsed } = logger();
     log.error({ err: 'just text' }, 'failed');
     log.error({ err: { code: 7 } }, 'failed');
+    log.error({ err: 'retry with Bearer abcdefghijklmnop' }, 'failed');
     expect(parsed().map((line) => line.err)).toEqual([
       { type: 'string', message: 'just text' },
       { type: 'object', message: '{"code":7}' },
+      { type: 'string', message: 'retry with [REDACTED]' },
     ]);
   });
 
@@ -244,6 +271,7 @@ describe('server log levels, identity and bindings', () => {
     expect(quiet.log.isLevelEnabled('info')).toBe(false);
     expect(quiet.log.isLevelEnabled('error')).toBe(true);
     expect(quiet.log.isLevelEnabled('nonsense')).toBe(false);
+    expect(quiet.log.isLevelEnabled('silent')).toBe(false);
 
     const silent = logger({ level: 'silent' });
     silent.log.fatal('nothing');
@@ -356,6 +384,12 @@ describe('FC_LOG_FORMAT escape hatch', () => {
     log.error({ err: new Error('bad\nthing'), count: 2 }, 'oops');
     expect(lines[0]).toMatch(/ ERROR ingest-server app\.log oops err="Error: bad thing" count=2$/);
   });
+
+  it('text quotes a value holding = or a double quote, so key=value stays parseable', () => {
+    const { log, lines } = logger({ format: 'text' });
+    log.info({ pair: 'a=b', quote: 'say"hi' }, 'm');
+    expect(lines[0]).toMatch(/ m pair="a=b" quote="say\\"hi"$/);
+  });
 });
 
 describe('every event kind validates against the published schema', () => {
@@ -415,19 +449,83 @@ describe('console bridge', () => {
     lines.forEach(expectValidLine);
   });
 
-  it('parses a leading [TAG] into tag', () => {
+  it('parses a leading [TAG] into tag, multi-word tags included', () => {
     const { log, parsed } = logger();
     const { target } = fakeConsole();
     const uninstall = installConsoleBridge(log, target);
     target.log('[CAPTURE] stored %d bytes', 42);
     target.log('[failures:retry]', 'sweep done');
+    // Most of the scraper's tags hold a space.
+    target.log('[BROWSER POOL] Launching browser');
+    target.log('[SCRAPE QUEUE]  Enqueued item');
+    target.log('[SESSION MANAGER]', 'Initialized');
+    target.log('[SCRAPER API ] trailing space trimmed');
+    target.log(`[${'T'.repeat(64)}] longest tag`);
     target.log('no tag [HERE]');
+    target.log(`[${'T'.repeat(65)}] too long for a tag`);
+    target.log('[ ] blank');
+    target.log('["a", "b"]');
     uninstall();
     expect(parsed().map((line) => [line.tag, line.msg])).toEqual([
       ['CAPTURE', 'stored 42 bytes'],
       ['failures:retry', 'sweep done'],
+      ['BROWSER POOL', 'Launching browser'],
+      ['SCRAPE QUEUE', 'Enqueued item'],
+      ['SESSION MANAGER', 'Initialized'],
+      ['SCRAPER API', 'trailing space trimmed'],
+      ['T'.repeat(64), 'longest tag'],
       [undefined, 'no tag [HERE]'],
+      [undefined, `[${'T'.repeat(65)}] too long for a tag`],
+      [undefined, '[ ] blank'],
+      [undefined, '["a","b"]'],
     ]);
+  });
+
+  it("drops the legacy logger's leading [ISO timestamp] (the line has time) and reads the tag after it", () => {
+    const { log, parsed } = logger();
+    const { target } = fakeConsole();
+    const uninstall = installConsoleBridge(log, target);
+    target.log('[2026-09-29T12:00:00.000Z] [INFO] legacy scraper line');
+    target.warn('[2026-09-29T12:00:00Z] untagged legacy line');
+    uninstall();
+    expect(parsed().map((line) => [line.tag, line.msg])).toEqual([
+      ['INFO', 'legacy scraper line'],
+      [undefined, 'untagged legacy line'],
+    ]);
+  });
+
+  it('redacts sensitive keys in object and printf arguments, as for logger fields', () => {
+    const { log, lines, parsed } = logger();
+    const { target } = fakeConsole();
+    const uninstall = installConsoleBridge(log, target);
+    target.log({ cookie: 'sid=S3CR3T-COOKIE', authorization: 'Basic dXNlcjpodW50ZXIy', password: 'hunter2', site: 'orzgk' });
+    target.log('[SESSION MANAGER] restored', { headers: { cookie: 'sid=S3CR3T-COOKIE' } }, ['x', { apiKey: 'k-123' }]);
+    target.log('%o', { password: 'hunter2' });
+    target.log('form %j', { password: 'hunter2' });
+    target.log('login %s', { authorization: 'Basic dXNlcjpodW50ZXIy' });
+    target.log(JSON.stringify({ store: 'orzgk', session: { cookie: 'sid=S3CR3T-COOKIE' } }, null, 2));
+    target.log('fetching %s', new URL('https://img.store-cdn.example/a.jpg'));
+    uninstall();
+    expect(lines.join('\n')).not.toMatch(/S3CR3T|hunter2|dXNlcjpodW50ZXIy|k-123/);
+    expect(parsed().map((line) => line.msg)).toEqual([
+      '{"cookie":"[REDACTED]","authorization":"[REDACTED]","password":"[REDACTED]","site":"orzgk"}',
+      'restored {"headers":{"cookie":"[REDACTED]"}} ["x",{"apiKey":"[REDACTED]"}]',
+      "{ password: '[REDACTED]' }",
+      'form {"password":"[REDACTED]"}',
+      "login { authorization: '[REDACTED]' }",
+      '{"store":"orzgk","session":{"cookie":"[REDACTED]"}}',
+      // A class instance keeps its own string form.
+      'fetching https://img.store-cdn.example/a.jpg',
+    ]);
+  });
+
+  it("uses the logger's own redaction options for bridged objects, through a child too", () => {
+    const { log, parsed } = logger({ redact: { sensitiveKeyPattern: /dpop/i } });
+    const { target } = fakeConsole();
+    const uninstall = installConsoleBridge(log.child({ component: 'auth' }), target);
+    target.log('proof', { dpopKey: 'jwk-secret', password: 'visible-under-a-custom-pattern' });
+    uninstall();
+    expect(parsed()[0].msg).toBe('proof {"dpopKey":"[REDACTED]","password":"visible-under-a-custom-pattern"}');
   });
 
   it('collapses a multi-line JSON string argument to one compact line', () => {

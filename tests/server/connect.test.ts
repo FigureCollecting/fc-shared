@@ -98,6 +98,7 @@ function setup(options: { baseUrl?: string; outer?: Interceptor[]; clientInterce
           if (req.value === 'invalid') throw new ConnectError('bad input', Code.InvalidArgument);
           if (req.value === 'down') throw new ConnectError('spine down', Code.Unavailable);
           if (req.value === 'plain') throw new Error('plain failure');
+          if (req.value === 'unknown') throw new ConnectError('upstream said nothing useful', Code.Unknown);
           return create(StringValueSchema, { value: req.value });
         },
         count: async function* (req: StringValue, ctx: HandlerContext) {
@@ -212,6 +213,7 @@ describe('rpc interceptors: failures', () => {
     ['down', 'unavailable', 'error', 'ConnectError'],
     // Connect sends a handler's plain Error as internal; both lines must agree.
     ['plain', 'internal', 'error', 'Error'],
+    ['unknown', 'unknown', 'error', 'ConnectError'],
   ])('%s -> code %s at level %s on both sides, span status ERROR', async (input, code, level, errType) => {
     const { echo, serverLines, clientLines } = setup();
     await expect(echo.echo(message(input))).rejects.toBeInstanceOf(ConnectError);
@@ -305,6 +307,8 @@ describe('rpc helpers', () => {
     expect(peerFromHeader(MESH_ID)).toBe(MESH_ID);
     expect(peerFromHeader('UPPER.case.example')).toBe('upper.case.example');
     expect(peerFromHeader('a'.repeat(300))).toBe('invalid');
+    // Every label is legal, but the whole name is over DNS's 253 characters.
+    expect(peerFromHeader(Array.from({ length: 5 }, () => 'a'.repeat(60)).join('.'))).toBe('invalid');
     expect(peerFromHeader('has space.example')).toBe('invalid');
   });
 });

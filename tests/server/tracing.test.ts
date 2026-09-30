@@ -8,23 +8,53 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import * as net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SpanKind, context, propagation, trace } from '@opentelemetry/api';
-import { InMemorySpanExporter } from '@opentelemetry/sdk-trace';
+import { ROOT_CONTEXT, SpanKind, context, propagation, trace, type TracerProvider as ApiTracerProvider } from '@opentelemetry/api';
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
+import { W3CTraceContextPropagator } from '@opentelemetry/core';
+import type { Instrumentation } from '@opentelemetry/instrumentation';
+import { InMemorySpanExporter, TracerProvider, type SpanExporter } from '@opentelemetry/sdk-trace';
 import { createLogger } from '../../src/server/log';
 import {
   ESM_LOADER_HOOK,
   esmLoaderHookPath,
   resolveTraceEndpoint,
   startTracing,
+  withPropagationTarget,
   type Tracing,
 } from '../../src/server/tracing';
-import { captureSink } from './helpers';
+import { SPAN_ID, TRACEPARENT, TRACE_ID, captureSink } from './helpers';
 
 let active: Tracing | undefined;
 afterEach(async () => {
   await active?.shutdown();
   active = undefined;
 });
+
+/** Inject for a valid sampled span headed to `target`; the carrier shows what would be sent. */
+function injectFor(target: string): Record<string, string> {
+  const span = trace.wrapSpanContext({ traceId: TRACE_ID, spanId: SPAN_ID, traceFlags: 1 });
+  const carrier: Record<string, string> = {};
+  propagation.inject(withPropagationTarget(trace.setSpan(ROOT_CONTEXT, span), target), carrier);
+  return carrier;
+}
+
+/** An Instrumentation built with enabled:false, recording what registration does to it. */
+function probeInstrumentation() {
+  const received: ApiTracerProvider[] = [];
+  const probe = {
+    instrumentationName: 'fc-test/probe',
+    instrumentationVersion: '0.0.0',
+    enable: jest.fn(),
+    disable: jest.fn(),
+    setTracerProvider: jest.fn((provider: ApiTracerProvider) => {
+      received.push(provider);
+    }),
+    setMeterProvider: jest.fn(),
+    setConfig: jest.fn(),
+    getConfig: () => ({ enabled: false }),
+  };
+  return { probe, instrumentation: probe as unknown as Instrumentation, received };
+}
 
 function inSpan<T>(fn: () => T, name = 'work'): T {
   return trace.getTracer('test').startActiveSpan(name, (span) => {
@@ -98,19 +128,40 @@ describe('startTracing without an endpoint (the no-op path)', () => {
   });
 
   it('releases every global on shutdown so tracing can start again', async () => {
-    const first = startTracing('first', { env: {} });
-    await first.shutdown();
-    const orphan = trace.getTracer('after').startSpan('after-shutdown');
-    expect(orphan.isRecording()).toBe(false);
-    orphan.end();
-    expect(inSpan(() => trace.getActiveSpan())).toBeUndefined();
-    const carrier: Record<string, string> = {};
-    propagation.inject(context.active(), carrier);
-    expect(carrier).toEqual({});
+    const disableManager = jest.spyOn(AsyncLocalStorageContextManager.prototype, 'disable');
+    try {
+      const { probe, instrumentation } = probeInstrumentation();
+      const first = startTracing('first', { env: {}, instrumentations: [instrumentation] });
+      expect(injectFor('http://localhost:3050/lookup')).toHaveProperty('traceparent');
+      disableManager.mockClear();
+      await first.shutdown();
 
-    active = startTracing('second', { env: {} });
-    expect(active).not.toBe(first);
-    expect(active.state.service).toBe('second');
+      expect(probe.disable).toHaveBeenCalledTimes(1);
+      expect(disableManager).toHaveBeenCalledTimes(1);
+      const orphan = trace.getTracer('after').startSpan('after-shutdown');
+      expect(orphan.isRecording()).toBe(false);
+      orphan.end();
+      expect(inSpan(() => trace.getActiveSpan())).toBeUndefined();
+      // Even an allowlisted target gets nothing: the propagator is gone too.
+      expect(injectFor('http://localhost:3050/lookup')).toEqual({});
+
+      active = startTracing('second', { env: {} });
+      expect(active).not.toBe(first);
+      expect(active.state.service).toBe('second');
+    } finally {
+      disableManager.mockRestore();
+    }
+  });
+
+  it('registers the given instrumentations against its own provider, enabling one built disabled', async () => {
+    const exporter = new InMemorySpanExporter();
+    const { probe, instrumentation, received } = probeInstrumentation();
+    active = startTracing('scraper', { env: {}, exporter, instrumentations: [instrumentation] });
+    expect(probe.enable).toHaveBeenCalledTimes(1);
+    expect(received).toHaveLength(1);
+    received[0].getTracer('probe').startSpan('from-instrumentation').end();
+    await active.forceFlush();
+    expect(exporter.getFinishedSpans().map((span) => span.name)).toEqual(['from-instrumentation']);
   });
 
   it('adds FC_TRACE_PROPAGATE_HOSTS and the propagateHosts option to the allowlist', () => {
@@ -156,7 +207,7 @@ describe('startTracing with an exporter', () => {
     expect(active.state.endpoint).toBe('http://otel-collector.observability:4317/');
   });
 
-  it('does not throw or block when the collector is unreachable, and drops past the queue bound', async () => {
+  it('does not throw or block when the collector refuses connections', async () => {
     const closedPort = await new Promise<number>((resolve) => {
       const probe = net.createServer();
       probe.listen(0, '127.0.0.1', () => {
@@ -180,6 +231,114 @@ describe('startTracing with an exporter', () => {
     await expect(active.forceFlush()).resolves.toBeUndefined();
     await expect(active.shutdown()).resolves.toBeUndefined();
     active = undefined;
+  });
+
+  it('bounds forceFlush AND shutdown by exportTimeoutMillis when the collector accepts and never answers', async () => {
+    const sockets: net.Socket[] = [];
+    const blackHole = net.createServer((socket) => {
+      sockets.push(socket);
+    });
+    await new Promise<void>((resolve) => blackHole.listen(0, '127.0.0.1', resolve));
+    const { port } = blackHole.address() as net.AddressInfo;
+    try {
+      active = startTracing('scraper', {
+        env: { OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}` },
+        batch: { exportTimeoutMillis: 300 },
+      });
+      inSpan(() => undefined);
+      let started = performance.now();
+      await active.forceFlush();
+      const flushMs = performance.now() - started;
+      started = performance.now();
+      await active.shutdown();
+      active = undefined;
+      const shutdownMs = performance.now() - started;
+
+      expect(sockets.length).toBeGreaterThan(0);
+      expect({ flushMs: flushMs < 2_000, shutdownMs: shutdownMs < 2_000 }).toEqual({ flushMs: true, shutdownMs: true });
+    } finally {
+      sockets.forEach((socket) => socket.destroy());
+      await new Promise((resolve) => blackHole.close(resolve));
+    }
+  }, 20_000);
+
+  it('waits at most exportTimeoutMillis, 10 s by default, for an export that never answers', async () => {
+    const neverAnswers: SpanExporter = { export: () => undefined, shutdown: () => Promise.resolve() };
+    jest.useFakeTimers();
+    try {
+      active = startTracing('scraper', { env: {}, exporter: neverAnswers });
+      inSpan(() => undefined);
+      let settled = false;
+      const flushed = active.forceFlush().then(() => {
+        settled = true;
+      });
+      await jest.advanceTimersByTimeAsync(9_999);
+      expect(settled).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      await flushed;
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it.each([
+    ['the default bound (2048 queued, 512 per batch)', undefined, 2048 + 512],
+    ['a configured bound', { maxQueueSize: 64, maxExportBatchSize: 16 }, 64 + 16],
+  ])('drops spans past %s rather than queueing without limit', async (_label, batch, most) => {
+    const exporter = new InMemorySpanExporter();
+    active = startTracing('scraper', { env: {}, exporter, ...(batch === undefined ? {} : { batch }) });
+    const tracer = trace.getTracer('flood');
+    for (let i = 0; i < 5000; i += 1) {
+      tracer.startSpan(`span-${i}`).end();
+    }
+    await active.forceFlush();
+    const exported = exporter.getFinishedSpans().length;
+    expect(exported).toBeGreaterThan(0);
+    expect(exported).toBeLessThanOrEqual(most);
+  });
+});
+
+describe('startTracing when another OpenTelemetry setup registered first', () => {
+  afterEach(() => {
+    context.disable();
+    propagation.disable();
+    trace.disable();
+  });
+
+  it('throws naming the taken globals, rolls back its own, and leaves the other setup untouched', () => {
+    propagation.setGlobalPropagator(new W3CTraceContextPropagator());
+    trace.setGlobalTracerProvider(new TracerProvider());
+
+    expect(() => startTracing('scraper', { env: {} })).toThrow(
+      /OpenTelemetry globals already registered: propagation, trace/,
+    );
+    // Its own context manager was released again...
+    expect(context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable())).toBe(true);
+    // ...and the other setup still works as it did (it would have leaked either way).
+    expect(injectFor('https://img.store-cdn.example/a.jpg')).toEqual({ traceparent: TRACEPARENT });
+  });
+
+  it('throws when only the context manager is taken, releasing its propagator and provider', () => {
+    context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
+
+    expect(() => startTracing('scraper', { env: {} })).toThrow(/OpenTelemetry globals already registered: context$/);
+    expect(propagation.setGlobalPropagator(new W3CTraceContextPropagator())).toBe(true);
+    expect(trace.setGlobalTracerProvider(new TracerProvider())).toBe(true);
+  });
+
+  it('starts normally once the other setup is gone', async () => {
+    propagation.setGlobalPropagator(new W3CTraceContextPropagator());
+    expect(() => startTracing('scraper', { env: {} })).toThrow(/propagation/);
+    propagation.disable();
+
+    const tracing = startTracing('scraper', { env: {} });
+    try {
+      expect(injectFor('https://img.store-cdn.example/a.jpg')).toEqual({});
+      expect(injectFor('http://scraper.fc.svc:3050/lookup')).toEqual({ traceparent: TRACEPARENT });
+    } finally {
+      await tracing.shutdown();
+    }
   });
 });
 

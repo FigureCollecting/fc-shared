@@ -6,7 +6,7 @@
 import * as http from 'node:http';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import request from 'supertest';
-import { SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
+import { INVALID_SPAN_CONTEXT, SpanKind, SpanStatusCode, context, trace } from '@opentelemetry/api';
 import { InMemorySpanExporter, type ReadableSpan } from '@opentelemetry/sdk-trace';
 import { createLogger } from '../../src/server/log';
 import { httpLogMiddleware, routeTemplate } from '../../src/server/express';
@@ -25,7 +25,7 @@ afterEach(async () => {
   await tracing.shutdown();
 });
 
-function app(options: { outerSpan?: boolean } = {}) {
+function app(options: { outerSpan?: boolean; invalidOuterSpan?: boolean } = {}) {
   const capture = captureSink();
   const logger = createLogger({ service: 'scraper', version: '2.1.2', env: {}, sink: capture.sink });
   const handlerIds: Array<{ traceId?: string; spanId?: string }> = [];
@@ -37,6 +37,11 @@ function app(options: { outerSpan?: boolean } = {}) {
         res.once('finish', () => span.end());
         next();
       });
+    });
+  }
+  if (options.invalidOuterSpan) {
+    server.use((_req: Request, _res: Response, next: NextFunction) => {
+      context.with(trace.setSpan(context.active(), trace.wrapSpanContext(INVALID_SPAN_CONTEXT)), () => next());
     });
   }
   server.use(httpLogMiddleware({ logger, ignorePaths: ['/healthz'] }));
@@ -53,6 +58,9 @@ function app(options: { outerSpan?: boolean } = {}) {
   server.use('/ingest', ingest);
   server.get('/healthz', (_req, res) => {
     res.send('ok');
+  });
+  server.get('/bad', (_req, res) => {
+    res.status(400).json({ error: 'bad request' });
   });
   server.get('/boom', () => {
     throw new Error('handler exploded');
@@ -124,6 +132,12 @@ describe('httpLogMiddleware', () => {
     expect(only(lines())).toMatchObject({ call: 'GET <unmatched>', code: '404', level: 'warn' });
   });
 
+  it('logs a 400 at warn, not info', async () => {
+    const { server, lines } = app();
+    await request(server).get('/bad').expect(400);
+    expect(only(lines())).toMatchObject({ call: 'GET /bad', code: '400', level: 'warn' });
+  });
+
   it('logs a 5xx at error and marks the span failed', async () => {
     const { server, lines } = app();
     await request(server).get('/boom').expect(500);
@@ -145,6 +159,14 @@ describe('httpLogMiddleware', () => {
     const line = only(lines());
     expect(line).toMatchObject({ call: 'GET /abort', code: '499', aborted: true, level: 'warn' });
     expectValidLine(line);
+  });
+
+  it("does not mistake an all-zero active span for a real one: the caller's trace is still extracted", async () => {
+    const { server, lines } = app({ invalidOuterSpan: true });
+    await request(server).get('/ingest/items/9').set('traceparent', TRACEPARENT).expect(200);
+    expect(only(lines()).trace_id).toBe(TRACE_ID);
+    const [span] = await spans();
+    expect(span.parentSpanContext?.spanId).toBe(SPAN_ID);
   });
 
   it('reuses an already-active server span instead of opening a second one', async () => {

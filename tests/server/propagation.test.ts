@@ -85,6 +85,14 @@ describe('createHostAllowlist', () => {
     expect(custom('ingest-server.fc')).toBe(false);
   });
 
+  it('never lets a bare wildcard ("*.", "*..") allow every dotted host', () => {
+    for (const entries of [['*.'], ['*..'], propagationHostsFromEnv({ FC_TRACE_PROPAGATE_HOSTS: '*.,*..' })]) {
+      const matcher = createHostAllowlist(entries);
+      expect(matcher('img.store-cdn.example')).toBe(false);
+      expect(matcher('myfigurecollection.net')).toBe(false);
+    }
+  });
+
   it('extends the defaults from FC_TRACE_PROPAGATE_HOSTS, never replaces them', () => {
     expect(PROPAGATE_HOSTS_ENV).toBe('FC_TRACE_PROPAGATE_HOSTS');
     expect(propagationHostsFromEnv({ FC_TRACE_PROPAGATE_HOSTS: 'ingest-server, *.internal,,' })).toEqual([
@@ -140,6 +148,26 @@ describe('AllowlistPropagator on synthetic contexts', () => {
     const carrier = injected(ROOT_CONTEXT, { [key]: value });
     expect('traceparent' in carrier).toBe(allowed);
     expect('baggage' in carrier).toBe(allowed);
+  });
+
+  it.each([
+    ['SERVER', SpanKind.SERVER],
+    ['INTERNAL', SpanKind.INTERNAL],
+    ['CONSUMER', SpanKind.CONSUMER],
+  ])('ignores target attributes on a %s span: its server.address names this host, not the next hop', (_name, kind) => {
+    const span = tracer.startSpan('inbound', { kind, attributes: { 'server.address': 'scraper.fc.svc' } });
+    const carrier: Record<string, string> = {};
+    propagator.inject(trace.setSpan(ROOT_CONTEXT, span), carrier, { set: (c, k, v) => { c[k] = v; } });
+    span.end();
+    expect(carrier).toEqual({});
+  });
+
+  it('reads the target from a PRODUCER span as from a CLIENT span', () => {
+    const span = tracer.startSpan('enqueue', { kind: SpanKind.PRODUCER, attributes: { 'server.address': 'queue.fc.svc' } });
+    const carrier: Record<string, string> = {};
+    propagator.inject(trace.setSpan(ROOT_CONTEXT, span), carrier, { set: (c, k, v) => { c[k] = v; } });
+    span.end();
+    expect(carrier).toHaveProperty('traceparent');
   });
 
   it('fails closed when the target is unknown (no attributes, or a non-recording span)', () => {
