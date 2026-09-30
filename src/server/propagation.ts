@@ -13,7 +13,9 @@
  *   2. Otherwise the CLIENT span in the context being injected: http and undici
  *      start that span with server.address / url.full BEFORE they inject, so the
  *      target is on it. Older semantic conventions (http.url, net.peer.name,
- *      http.host) are read too.
+ *      http.host) are read too. A PRODUCER span counts as well. Any other kind
+ *      does not: on a SERVER span, server.address is THIS host, taken from the
+ *      caller's Host header, and says nothing about where a request goes next.
  * No target, or a non-recording span with no attributes: nothing is injected.
  * Extraction (inbound) is never restricted.
  *
@@ -21,6 +23,7 @@
  * without pulling in the SDK.
  */
 import {
+  SpanKind,
   createContextKey,
   type Context,
   type TextMapGetter,
@@ -87,10 +90,13 @@ export function withPropagationTarget(ctx: Context, target: string): Context {
   return ctx.setValue(TARGET_KEY, target);
 }
 
+/** Span kinds whose attributes name an OUTBOUND target. */
+const OUTBOUND_KINDS: ReadonlySet<unknown> = new Set([SpanKind.CLIENT, SpanKind.PRODUCER]);
+
 function attributeTarget(ctx: Context): string | undefined {
-  const span = trace.getSpan(ctx) as { attributes?: Record<string, unknown> } | undefined;
+  const span = trace.getSpan(ctx) as { kind?: SpanKind; attributes?: Record<string, unknown> } | undefined;
   const attributes = span?.attributes;
-  if (attributes === undefined) return undefined;
+  if (attributes === undefined || !OUTBOUND_KINDS.has(span?.kind)) return undefined;
   for (const key of ['server.address', 'url.full', 'http.url', 'net.peer.name', 'http.host']) {
     const value = attributes[key];
     if (typeof value === 'string' && value !== '') return value;

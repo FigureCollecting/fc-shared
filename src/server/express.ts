@@ -12,6 +12,14 @@
  * the handler and everything it awaits run inside it. When a span is already
  * active (http auto-instrumentation) it is reused, not duplicated.
  *
+ * Known limits:
+ *   - Call listen() OUTSIDE any span. A server started inside one (a boot
+ *     span) reuses it for every request and ignores the caller's traceparent.
+ *   - When a handler in a MOUNTED router fails and an app-level error handler
+ *     answers, Express has already restored req.baseUrl, so call loses the
+ *     mount prefix ('GET /:id', not 'GET /api/v1/items/:id'). Routers mounted
+ *     at '/' are unaffected.
+ *
  * Typed structurally over node:http, so there is no runtime or type dependency
  * on express itself.
  */

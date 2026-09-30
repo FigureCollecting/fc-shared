@@ -96,6 +96,21 @@ third parties, for every instrumented `http` and `fetch` call as well as the
 Connect client. A short Service name such as `ingest-server` is not on the
 list; use the `.svc` name or add it through `FC_TRACE_PROPAGATE_HOSTS`.
 
+**One tracing setup per process.** `startTracing` throws if another
+OpenTelemetry setup (e.g. NodeSDK) already registered the context manager,
+propagator or tracer provider; the allowlist and span redaction would
+otherwise silently not apply. Remove the other setup.
+
+**A dead collector** never throws into the app, and ending a span never
+blocks: the queue drops past `maxQueueSize` (2048). `forceFlush`, `shutdown`
+and `runJob`'s final flush do wait, at most `exportTimeoutMillis` (default
+10 s) when the collector accepts connections and never answers.
+
+**Console bridge.** `installConsoleBridge(logger)` turns `console.*` into
+`app.console` lines: a leading `[TAG]` (e.g. `[BROWSER POOL]`) becomes `tag`,
+and objects, printf arguments and JSON strings are key-redacted with the
+logger's own options, as logger fields are.
+
 **ESM services** (`"type": "module"`) must preload the OpenTelemetry loader hook,
 or instrumentations (pg, for one) never see modules loaded through `import`:
 

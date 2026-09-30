@@ -16,6 +16,10 @@
  *
  * Streaming responses are measured to the end of the stream, so a stream that
  * fails half-way is logged with the failure's code.
+ *
+ * Start the server OUTSIDE any span: a call arriving while a span is active
+ * (e.g. a boot span around listen()) nests under it and ignores the caller's
+ * traceparent.
  */
 import {
   SpanKind,

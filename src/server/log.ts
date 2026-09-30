@@ -270,12 +270,15 @@ function render(core: Core, level: LogLevel, args: unknown[], bindings: Record<s
   return core.format === 'text' ? toText(entry) : JSON.stringify(entry);
 }
 
+/** Each logger's redaction options, so the console bridge redacts exactly as its logger does. */
+const REDACT_OF = new WeakMap<Logger, RedactOptions>();
+
 function makeLogger(core: Core, level: LevelSetting, bindings: Record<string, unknown>): Logger {
   const threshold = SEVERITY[level];
   const emit = (at: LogLevel, args: unknown[]): void => {
     if (SEVERITY[at] >= threshold) core.sink(render(core, at, args, bindings));
   };
-  return {
+  const logger: Logger = {
     level,
     trace: (...args) => emit('trace', args),
     debug: (...args) => emit('debug', args),
@@ -290,6 +293,8 @@ function makeLogger(core: Core, level: LevelSetting, bindings: Record<string, un
     isLevelEnabled: (candidate) =>
       (LOG_LEVELS as readonly string[]).includes(candidate) && SEVERITY[candidate as LogLevel] >= threshold,
   };
+  REDACT_OF.set(logger, core.redact);
+  return logger;
 }
 
 const stdoutSink = (line: string): void => {
@@ -333,45 +338,71 @@ const BRIDGED: ReadonlyArray<[keyof ConsoleLike, LogLevel]> = [
   ['debug', 'debug'],
 ];
 
-const LEADING_TAG = /^\[([^\]\s]{1,64})\]\s*/;
+/** The legacy scraper logger's own `[ISO timestamp] ` prefix: redundant with `time`, dropped. */
+const LEADING_TIMESTAMP = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})\]\s*/;
+/** `[BROWSER POOL] `: a letter first, at most 64 characters, inner spaces allowed. */
+const LEADING_TAG = /^\[([A-Za-z][^\[\]\r\n]{0,63})\]\s*/;
 const PRINTF = /%[sdifjoOc]/;
 
-/** A string that is a (possibly pretty-printed) JSON document, re-emitted compact. */
-function compactJson(text: string): string {
+/** A plain object or array: data to redact by key. A class instance keeps its own string form. */
+function isPlainData(value: unknown): boolean {
+  if (Array.isArray(value)) return true;
+  if (value === null || typeof value !== 'object') return false;
+  const proto: unknown = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/** Key-based redaction for a bridged argument, as flatValue applies to a logger field. */
+function redactData(value: unknown, redact: RedactOptions): unknown {
+  return isPlainData(value) ? redactValue(value, { ...redact, maxDepth: MAX_FIELD_DEPTH }) : value;
+}
+
+/** A string that is a (possibly pretty-printed) JSON document, re-emitted compact and redacted. */
+function compactJson(text: string, redact: RedactOptions): string {
   const trimmed = text.trim();
   if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return text;
   try {
-    return JSON.stringify(JSON.parse(trimmed));
+    return JSON.stringify(redactValue(JSON.parse(trimmed), redact));
   } catch {
     return text;
   }
 }
 
-function consoleArg(arg: unknown): string {
-  if (typeof arg === 'string') return compactJson(arg);
+function consoleArg(arg: unknown, redact: RedactOptions): string {
+  if (typeof arg === 'string') return compactJson(arg, redact);
   if (arg instanceof Error) return `${arg.name}: ${arg.message}`;
-  return sanitizeLogValue(arg);
+  return sanitizeLogValue(redactData(arg, redact));
 }
 
-function consoleText(args: unknown[]): string {
-  const [first] = args;
+function consoleText(args: unknown[], redact: RedactOptions): string {
+  const [first, ...rest] = args;
   if (typeof first === 'string' && PRINTF.test(first)) {
-    return formatWithOptions({ breakLength: Number.POSITIVE_INFINITY, compact: true, colors: false }, ...args);
+    return formatWithOptions(
+      { breakLength: Number.POSITIVE_INFINITY, compact: true, colors: false },
+      first,
+      ...rest.map((arg) => redactData(arg, redact)),
+    );
   }
-  return args.map(consoleArg).join(' ');
+  return args.map((arg) => consoleArg(arg, redact)).join(' ');
 }
 
 /**
  * Route console.log/info/warn/error/debug through `logger` as one app.console
- * line each (log -> info). A leading `[TAG]` becomes the `tag` field, an Error
- * argument becomes `err`, and a pretty-printed JSON string is collapsed to one
- * line. Returns an uninstall function that restores the original methods.
+ * line each (log -> info). A leading `[TAG]` (spaces allowed, e.g. `[BROWSER
+ * POOL]`) becomes the `tag` field, after dropping a leading `[ISO timestamp]`;
+ * an Error argument becomes `err`, and a pretty-printed JSON string is
+ * collapsed to one line. Objects, arrays, printf arguments and JSON strings are
+ * key-redacted with the logger's own options (cookie, authorization, password
+ * ...), as a logger field would be. Free text is covered only by the value
+ * patterns (Bearer, JWT, ...), exactly as for msg. Returns an uninstall
+ * function that restores the original methods.
  *
  * A console call made while a bridged line is being written (a sink that itself
  * logs to console) goes straight to the original method instead of recursing.
  */
 export function installConsoleBridge(logger: Logger, target: ConsoleLike = console): () => void {
   const originals: Array<[keyof ConsoleLike, ConsoleMethod]> = [];
+  const redact = REDACT_OF.get(logger) ?? {};
   let writing = false;
 
   for (const [method, level] of BRIDGED) {
@@ -384,11 +415,11 @@ export function installConsoleBridge(logger: Logger, target: ConsoleLike = conso
       }
       writing = true;
       try {
-        let text = consoleText(args);
+        let text = consoleText(args, redact).replace(LEADING_TIMESTAMP, '');
         const fields: Record<string, unknown> = { event: 'app.console' };
         const tag = LEADING_TAG.exec(text);
         if (tag !== null) {
-          fields['tag'] = tag[1];
+          fields['tag'] = tag[1].trim();
           text = text.slice(tag[0].length);
         }
         const err = args.find((arg) => arg instanceof Error);

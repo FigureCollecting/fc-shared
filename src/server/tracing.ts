@@ -10,12 +10,20 @@
  *     var is the rollback.
  *   - Every exported span passes the RedactingSpanExporter (query strings,
  *     userinfo, secrets).
- *   - The batch queue is bounded and DROPS when full; a dead collector never
- *     blocks or throws into the app (forceFlush/shutdown swallow export errors).
+ *   - The batch queue is bounded and DROPS when full; ending a span never
+ *     blocks and a dead collector never throws into the app (forceFlush and
+ *     shutdown swallow export errors). forceFlush, shutdown and runJob's final
+ *     flush DO wait for the collector, at most exportTimeoutMillis (default
+ *     10 s) when it accepts connections and never answers; the OTLP exporter
+ *     gets the same deadline, so shutdown is bounded by it too.
  *   - The global propagator is W3C traceparent + baggage behind the
  *     AllowlistPropagator: headers go to cluster-internal hosts only.
  *   - An AsyncLocalStorage context manager is registered explicitly, so the
  *     active span survives `await`.
+ *   - It must be the process's ONLY OpenTelemetry setup. If another one (e.g.
+ *     NodeSDK) registered the context manager, propagator or tracer provider
+ *     first, startTracing throws and releases whatever it did register:
+ *     otherwise the allowlist and the redaction would silently not apply.
  *
  * Built on @opentelemetry/sdk-trace's TracerProvider rather than NodeSDK:
  * NodeSDK also drags in the metrics and logs SDKs plus every OTLP transport,
@@ -95,7 +103,11 @@ export interface BatchOptions {
   maxExportBatchSize?: number;
   /** Default 5000. */
   scheduledDelayMillis?: number;
-  /** Per-export budget before it is abandoned. Default 10000. */
+  /**
+   * Per-export budget before it is abandoned, and the longest forceFlush waits
+   * on a collector that never answers. Also the OTLP exporter's deadline.
+   * Default 10000.
+   */
   exportTimeoutMillis?: number;
 }
 
@@ -157,7 +169,8 @@ function quietly(label: string, work: Promise<unknown>): Promise<void> {
 
 /**
  * Register tracing for this process. Idempotent: a second call returns the
- * running handle unchanged.
+ * running handle unchanged. Throws if another OpenTelemetry setup already
+ * registered a global (see the module comment).
  */
 export function startTracing(service: string, options: StartTracingOptions = {}): Tracing {
   if (running !== undefined) return running;
@@ -171,12 +184,11 @@ export function startTracing(service: string, options: StartTracingOptions = {})
   if (kind === 'noop') {
     processor = new NoopSpanProcessor();
   } else {
-    const target = options.exporter ?? new OTLPTraceExporter({ url: endpoint });
-    processor = new BatchSpanProcessor({
-      ...BATCH_DEFAULTS,
-      ...options.batch,
-      exporter: new RedactingSpanExporter(target, options.redact),
-    });
+    const batch = { ...BATCH_DEFAULTS, ...options.batch };
+    // One deadline: a gRPC call left in flight would otherwise hold shutdown for
+    // the exporter's own 10 s default, whatever exportTimeoutMillis says.
+    const target = options.exporter ?? new OTLPTraceExporter({ url: endpoint, timeoutMillis: batch.exportTimeoutMillis });
+    processor = new BatchSpanProcessor({ ...batch, exporter: new RedactingSpanExporter(target, options.redact) });
   }
 
   const provider = new TracerProvider({
@@ -185,16 +197,33 @@ export function startTracing(service: string, options: StartTracingOptions = {})
   });
 
   const contextManager = new AsyncLocalStorageContextManager().enable();
-  context.setGlobalContextManager(contextManager);
-
   const propagateHosts = [...propagationHostsFromEnv(env), ...(options.propagateHosts ?? [])];
-  propagation.setGlobalPropagator(
-    new AllowlistPropagator(
-      new CompositePropagator({ propagators: [new W3CTraceContextPropagator(), new W3CBaggagePropagator()] }),
-      createHostAllowlist(propagateHosts),
+  const registered = {
+    context: context.setGlobalContextManager(contextManager),
+    propagation: propagation.setGlobalPropagator(
+      new AllowlistPropagator(
+        new CompositePropagator({ propagators: [new W3CTraceContextPropagator(), new W3CBaggagePropagator()] }),
+        createHostAllowlist(propagateHosts),
+      ),
     ),
-  );
-  trace.setGlobalTracerProvider(provider);
+    trace: trace.setGlobalTracerProvider(provider),
+  };
+  const taken = Object.entries(registered)
+    .filter(([, ok]) => !ok)
+    .map(([api]) => api);
+  if (taken.length > 0) {
+    // Release only what THIS call registered; the other setup keeps its own.
+    if (registered.context) context.disable();
+    else contextManager.disable();
+    if (registered.propagation) propagation.disable();
+    if (registered.trace) trace.disable();
+    void quietly('shutdown', provider.shutdown());
+    throw new Error(
+      'fc-shared startTracing: another OpenTelemetry setup (e.g. NodeSDK) is already running; remove it, ' +
+        'startTracing must be the only one. OpenTelemetry globals already registered: ' +
+        taken.join(', '),
+    );
+  }
 
   const unregister = registerInstrumentations({ instrumentations: options.instrumentations ?? [], tracerProvider: provider });
 
@@ -210,8 +239,8 @@ export function startTracing(service: string, options: StartTracingOptions = {})
     shutdown: async () => {
       unregister();
       await quietly('shutdown', provider.shutdown());
-      contextManager.disable();
       trace.disable();
+      // Also disables contextManager: the API disables the manager it holds.
       context.disable();
       propagation.disable();
       running = undefined;

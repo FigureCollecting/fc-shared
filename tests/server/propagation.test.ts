@@ -85,11 +85,13 @@ describe('createHostAllowlist', () => {
     expect(custom('ingest-server.fc')).toBe(false);
   });
 
-  it('never lets a bare wildcard ("*.", "*..") allow every dotted host', () => {
+  it('never lets a bare wildcard ("*.", "*..") allow a host', () => {
     for (const entries of [['*.'], ['*..'], propagationHostsFromEnv({ FC_TRACE_PROPAGATE_HOSTS: '*.,*..' })]) {
       const matcher = createHostAllowlist(entries);
       expect(matcher('img.store-cdn.example')).toBe(false);
       expect(matcher('myfigurecollection.net')).toBe(false);
+      // A hostname URL accepts; '*..' would otherwise become the suffix '.', which it ends with.
+      expect(matcher(new URL('https://img.store-cdn.example../a.jpg').hostname)).toBe(false);
     }
   });
 

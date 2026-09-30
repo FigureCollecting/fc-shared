@@ -13,6 +13,7 @@ import {
   installConsoleBridge,
   resolveServiceIdentity,
   toSnakeCase,
+  type Logger,
 } from '../../src/server/log';
 import { SPAN_ID, TRACE_ID, captureSink, expectValidLine, withRemoteSpan } from './helpers';
 
@@ -152,6 +153,12 @@ describe('server log line shape', () => {
     const [line] = parsed();
     expect(line.msg).toBe('["a","b"] x');
     expect(line).not.toHaveProperty('f_0');
+  });
+
+  it('keeps a non-finite number readable instead of letting JSON turn it into null', () => {
+    const { log, parsed } = logger();
+    log.info({ ratio: Number.NaN, ceiling: Number.POSITIVE_INFINITY });
+    expect(parsed()[0]).toMatchObject({ ratio: 'NaN', ceiling: 'Infinity' });
   });
 
   it('walks an object field at most four levels deep', () => {
@@ -505,8 +512,11 @@ describe('console bridge', () => {
     target.log('login %s', { authorization: 'Basic dXNlcjpodW50ZXIy' });
     target.log(JSON.stringify({ store: 'orzgk', session: { cookie: 'sid=S3CR3T-COOKIE' } }, null, 2));
     target.log('fetching %s', new URL('https://img.store-cdn.example/a.jpg'));
+    target.log(Object.assign(Object.create(null) as object, { token: 't-456' }));
+    target.log({ a: { b: { c: { d: { e: 1 } } } } });
+    target.log('nothing', null, undefined, 3);
     uninstall();
-    expect(lines.join('\n')).not.toMatch(/S3CR3T|hunter2|dXNlcjpodW50ZXIy|k-123/);
+    expect(lines.join('\n')).not.toMatch(/S3CR3T|hunter2|dXNlcjpodW50ZXIy|k-123|t-456/);
     expect(parsed().map((line) => line.msg)).toEqual([
       '{"cookie":"[REDACTED]","authorization":"[REDACTED]","password":"[REDACTED]","site":"orzgk"}',
       'restored {"headers":{"cookie":"[REDACTED]"}} ["x",{"apiKey":"[REDACTED]"}]',
@@ -516,7 +526,27 @@ describe('console bridge', () => {
       '{"store":"orzgk","session":{"cookie":"[REDACTED]"}}',
       // A class instance keeps its own string form.
       'fetching https://img.store-cdn.example/a.jpg',
+      '{"token":"[REDACTED]"}',
+      // Walked four levels deep, like a logger field.
+      '{"a":{"b":{"c":{"d":"[truncated:max-depth]"}}}}',
+      'nothing null undefined 3',
     ]);
+  });
+
+  it('redacts with the default options when bridging a logger fc-shared did not create', () => {
+    const received: unknown[][] = [];
+    const record = (...args: unknown[]) => {
+      received.push(args);
+    };
+    const foreign: Logger = {
+      level: 'info', trace: record, debug: record, info: record, warn: record, error: record, fatal: record,
+      silent: record, child: () => foreign, isLevelEnabled: () => true,
+    };
+    const { target } = fakeConsole();
+    const uninstall = installConsoleBridge(foreign, target);
+    target.log('login', { password: 'hunter2' });
+    uninstall();
+    expect(received).toEqual([[{ event: 'app.console' }, 'login {"password":"[REDACTED]"}']]);
   });
 
   it("uses the logger's own redaction options for bridged objects, through a child too", () => {

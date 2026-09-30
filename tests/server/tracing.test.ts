@@ -306,23 +306,37 @@ describe('startTracing when another OpenTelemetry setup registered first', () =>
     trace.disable();
   });
 
-  it('throws naming the taken globals, rolls back its own, and leaves the other setup untouched', () => {
+  it('throws naming the taken globals, rolls back its own, and leaves the other setup untouched', async () => {
     propagation.setGlobalPropagator(new W3CTraceContextPropagator());
     trace.setGlobalTracerProvider(new TracerProvider());
+    const exporter = new InMemorySpanExporter();
+    const exporterShutdown = jest.spyOn(exporter, 'shutdown');
 
-    expect(() => startTracing('scraper', { env: {} })).toThrow(
+    expect(() => startTracing('scraper', { env: {}, exporter })).toThrow(
       /OpenTelemetry globals already registered: propagation, trace/,
     );
-    // Its own context manager was released again...
+    // Its own context manager was released again, and its provider shut down...
     expect(context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable())).toBe(true);
-    // ...and the other setup still works as it did (it would have leaked either way).
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(exporterShutdown).toHaveBeenCalledTimes(1);
+    // ...while the other setup keeps its globals and works as it did (it would have leaked either way).
+    expect(trace.setGlobalTracerProvider(new TracerProvider())).toBe(false);
     expect(injectFor('https://img.store-cdn.example/a.jpg')).toEqual({ traceparent: TRACEPARENT });
   });
 
   it('throws when only the context manager is taken, releasing its propagator and provider', () => {
-    context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
-
-    expect(() => startTracing('scraper', { env: {} })).toThrow(/OpenTelemetry globals already registered: context$/);
+    const foreign = new AsyncLocalStorageContextManager().enable();
+    context.setGlobalContextManager(foreign);
+    const disableManager = jest.spyOn(AsyncLocalStorageContextManager.prototype, 'disable');
+    try {
+      expect(() => startTracing('scraper', { env: {} })).toThrow(/OpenTelemetry globals already registered: context$/);
+      // Its own, never-registered manager is disabled; the other setup's is not touched.
+      expect(disableManager).toHaveBeenCalledTimes(1);
+      expect(disableManager.mock.contexts[0]).not.toBe(foreign);
+    } finally {
+      disableManager.mockRestore();
+    }
+    expect(context.setGlobalContextManager(new AsyncLocalStorageContextManager())).toBe(false);
     expect(propagation.setGlobalPropagator(new W3CTraceContextPropagator())).toBe(true);
     expect(trace.setGlobalTracerProvider(new TracerProvider())).toBe(true);
   });
