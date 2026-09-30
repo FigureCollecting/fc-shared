@@ -136,6 +136,24 @@ describe('runJob', () => {
     expect(itemLines.map((line) => line.trace_id)).toEqual(itemIds);
   });
 
+  it('names an item item.enqueue and tags only fc.run_id when given no options', async () => {
+    const { logger } = jobLogger();
+    await runJob('ingest-crawler', (run) => run.item(() => 'queued'), { logger });
+    const item = exporter.getFinishedSpans().find((span) => span.name === 'item.enqueue') as ReadableSpan;
+    expect(Object.keys(item.attributes)).toEqual(['fc.run_id']);
+  });
+
+  it('runs, logs and returns with no tracing SDK registered at all', async () => {
+    await tracing?.shutdown();
+    tracing = undefined;
+    const { logger, parsed } = jobLogger();
+    await expect(runJob('ingest-crawler', (run) => run.item(() => 3), { logger })).resolves.toBe(3);
+    expect(parsed().map((line) => [line.event, line.trace_id])).toEqual([
+      ['job.start', undefined],
+      ['job.end', undefined],
+    ]);
+  });
+
   it('marks a failed item span as ERROR, rethrows, and lets the run decide', async () => {
     const { logger } = jobLogger();
     const outcome = await runJob('ingest-crawler', async (run) => {

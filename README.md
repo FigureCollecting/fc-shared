@@ -51,6 +51,59 @@ The ESM build emits shared chunks, so the barrel and a subpath resolve to one
 instance of a module rather than two copies. Mixing `require` and `import` of
 this package in a single process still yields two instances, as it always has.
 
+## Server subpaths (Node only, 1.8.0)
+
+Services share one log shape and one tracing setup through five node-only
+subpaths. They are built by a separate esbuild run with `--platform=node`, so
+the browser entry points above are byte-identical to 1.7.0, and nothing in the
+barrel or the browser-safe subpaths can reach them (`tests/package` checks both).
+
+| Subpath | Exports |
+| --- | --- |
+| `server/log` | `createLogger` (pino-compatible), `installConsoleBridge`, `resolveServiceIdentity` |
+| `server/tracing` | `startTracing`, `RedactingSpanExporter`, `AllowlistPropagator`, `ESM_LOADER_HOOK`, `esmLoaderHookPath` |
+| `server/connect` | `rpcServerInterceptor`, `rpcClientInterceptor` (rpc.in / rpc.out) |
+| `server/express` | `httpLogMiddleware` (http.in, route template as `call`) |
+| `server/job` | `runJob`, `itemContext`, `currentTraceparent`, `withTraceparent` |
+| `server/log-shape.schema.json` | the log-line contract (JSON Schema 2020-12) for consumers' tests |
+
+Every line is one JSON object on stdout: `time level service version event msg`,
+then `call code duration_ms peer trace_id span_id job err queue_ms` when they
+apply, then the event's own snake_case fields. `trace_id`/`span_id` are present
+only under an active span, never zeroed.
+
+The OpenTelemetry SDK and Connect are **optional peer dependencies**; a service
+that uses `server/tracing` or `server/connect` installs them:
+
+```bash
+npm install @opentelemetry/sdk-trace @opentelemetry/core @opentelemetry/resources \
+  @opentelemetry/context-async-hooks @opentelemetry/exporter-trace-otlp-grpc \
+  @opentelemetry/instrumentation @connectrpc/connect
+```
+
+| Env | Effect |
+| --- | --- |
+| `OTEL_SERVICE_NAME`, `SERVICE_VERSION` | `service` and `version` on lines and on the trace resource |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP **gRPC** export; unset = no-op export (ids still in logs, nothing leaves the pod) |
+| `LOG_LEVEL` | minimum level (default `info`) |
+| `FC_LOG_FORMAT=text` | escape hatch: the same fields as one human-readable line |
+| `JOB_NAME` | the Kubernetes Job name (downward API), stamped as `job` |
+| `FC_TRACE_PROPAGATE_HOSTS` | extra hosts (exact or `*.suffix`) allowed to receive `traceparent` |
+
+**Propagation allowlist.** `traceparent` and `baggage` go only to
+`*.svc.cluster.local`, `*.svc` and `localhost`, never to store CDNs or other
+third parties, for every instrumented `http` and `fetch` call as well as the
+Connect client. A short Service name such as `ingest-server` is not on the
+list; use the `.svc` name or add it through `FC_TRACE_PROPAGATE_HOSTS`.
+
+**ESM services** (`"type": "module"`) must preload the OpenTelemetry loader hook,
+or instrumentations (pg, for one) never see modules loaded through `import`:
+
+```bash
+node --experimental-loader=@opentelemetry/instrumentation/hook.mjs \
+     --import ./dist/tracing.js dist/server.js
+```
+
 ## Toolchain baseline
 
 fc-shared is the estate's BOM anchor, and ships the compiler settings that go
@@ -92,7 +145,7 @@ npm run build      # tsc -> dist/
 npm run lint       # tsc --noEmit type check
 ```
 
-Only `dist/` and `tsconfig.base.json` are published (see `files` in
+Only `dist/`, `schema/` and `tsconfig.base.json` are published (see `files` in
 `package.json`); `prepublishOnly` rebuilds `dist/` automatically before every
 publish.
 

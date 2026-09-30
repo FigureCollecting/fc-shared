@@ -78,7 +78,7 @@ afterEach(async () => {
   await tracing.shutdown();
 });
 
-function setup(options: { baseUrl?: string; outer?: Interceptor[] } = {}) {
+function setup(options: { baseUrl?: string; outer?: Interceptor[]; clientInterceptor?: boolean } = {}) {
   const server = captureSink();
   const client = captureSink();
   const serverLog = createLogger({ service: 'ingest-server', version: '1.9.0', env: {}, sink: server.sink });
@@ -111,7 +111,10 @@ function setup(options: { baseUrl?: string; outer?: Interceptor[] } = {}) {
     },
     {
       router: { interceptors: [...(options.outer ?? []), rpcServerInterceptor({ logger: serverLog })] },
-      transport: { baseUrl: options.baseUrl ?? INTERNAL, interceptors: [rpcClientInterceptor({ logger: clientLog })] },
+      transport: {
+        baseUrl: options.baseUrl ?? INTERNAL,
+        interceptors: options.clientInterceptor === false ? [] : [rpcClientInterceptor({ logger: clientLog })],
+      },
     },
   );
   const echo = createClient(EchoService, transport) as unknown as EchoClient;
@@ -182,6 +185,19 @@ describe('rpc interceptors: a unary round trip', () => {
     expect(only(serverLines()).trace_id).toBe(out.trace_id);
   });
 
+  it('extracts traceparent from the request headers when no span is active (a caller in another process)', async () => {
+    // The in-memory transport shares one async context between client and server,
+    // so without a client interceptor and outside any span the server sees only
+    // the header: exactly what a real remote call gives it.
+    const { echo, seen, serverLines } = setup({ clientInterceptor: false });
+    await echo.echo(message('remote'), { headers: { traceparent: `00-${'1'.repeat(32)}-${'2'.repeat(16)}-01` } });
+    expect(seen[0].traceId).toBe('1'.repeat(32));
+    expect(only(serverLines()).trace_id).toBe('1'.repeat(32));
+    const [serverSpan] = await exported();
+    expect(serverSpan.kind).toBe(SpanKind.SERVER);
+    expect(serverSpan.parentSpanContext).toMatchObject({ traceId: '1'.repeat(32), spanId: '2'.repeat(16), isRemote: true });
+  });
+
   it('takes peer from l5d-client-id, and marks a malformed one invalid', async () => {
     const { echo, serverLines } = setup();
     await echo.echo(message('a'), { headers: { 'l5d-client-id': MESH_ID } });
@@ -194,7 +210,8 @@ describe('rpc interceptors: failures', () => {
   it.each([
     ['invalid', 'invalid_argument', 'warn', 'ConnectError'],
     ['down', 'unavailable', 'error', 'ConnectError'],
-    ['plain', 'unknown', 'error', 'Error'],
+    // Connect sends a handler's plain Error as internal; both lines must agree.
+    ['plain', 'internal', 'error', 'Error'],
   ])('%s -> code %s at level %s on both sides, span status ERROR', async (input, code, level, errType) => {
     const { echo, serverLines, clientLines } = setup();
     await expect(echo.echo(message(input))).rejects.toBeInstanceOf(ConnectError);
@@ -278,6 +295,7 @@ describe('rpc helpers', () => {
     expect(codeName(new ConnectError('x', Code.DeadlineExceeded))).toBe('deadline_exceeded');
     expect(codeName(new ConnectError('x', Code.Unauthenticated))).toBe('unauthenticated');
     expect(codeName(new Error('x'))).toBe('unknown');
+    expect(codeName(new Error('x'), Code.Internal)).toBe('internal');
     expect(codeName('text')).toBe('unknown');
   });
 

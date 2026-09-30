@@ -135,6 +135,7 @@ describe('AllowlistPropagator on synthetic contexts', () => {
     ['http.host', 'localhost:8080', true],
     ['http.host', 'img.store-cdn.example:443', false],
     ['url.full', 'not a url', false],
+    ['url.full', 'http://exa mple/', false],
   ])('reads the target from the client span attribute %s=%s (allowed: %s)', (key, value, allowed) => {
     const carrier = injected(ROOT_CONTEXT, { [key]: value });
     expect('traceparent' in carrier).toBe(allowed);

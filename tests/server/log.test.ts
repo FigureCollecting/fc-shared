@@ -156,6 +156,7 @@ describe('server log line shape', () => {
       big: BigInt(7),
       nothing: null,
       skipped: undefined,
+      callback: () => undefined,
     });
     const [line] = parsed();
     expect(line).toMatchObject({
@@ -166,6 +167,7 @@ describe('server log line shape', () => {
       when: '2026-09-30T01:02:03.456Z',
       big: '7n',
       nothing: null,
+      callback: '[function]',
     });
     expect(line).not.toHaveProperty('skipped');
     expectValidLine(line);
@@ -180,7 +182,7 @@ describe('server log line shape', () => {
       note: 'retry with Bearer abcdefghijklmnop please',
       multi: 'line one\nline two\r\nline three',
       big: 'x'.repeat(5000),
-      nestedSecret: { password: 'hunter2' },
+      loginForm: { password: 'hunter2' },
     });
     const [line] = parsed();
     expect(line.authorization).toBe('[REDACTED]');
@@ -189,7 +191,7 @@ describe('server log line shape', () => {
     expect(line.note).toBe('retry with [REDACTED] please');
     expect(line.multi).toBe('line one line two  line three');
     expect((line.big as string).length).toBeLessThanOrEqual(1000 + '...[truncated]'.length);
-    expect(line.nested_secret).toBe('{"password":"[REDACTED]"}');
+    expect(line.login_form).toBe('{"password":"[REDACTED]"}');
     expect(lines[0]).not.toContain('hunter2');
     expectValidLine(line);
   });
@@ -203,10 +205,14 @@ describe('server log line shape', () => {
     expectValidLine(line);
   });
 
-  it('turns a non-Error err into a string message', () => {
+  it('turns a non-Error err into a typed string message', () => {
     const { log, parsed } = logger();
     log.error({ err: 'just text' }, 'failed');
-    expect(parsed()[0].err).toEqual({ type: 'string', message: 'just text' });
+    log.error({ err: { code: 7 } }, 'failed');
+    expect(parsed().map((line) => line.err)).toEqual([
+      { type: 'string', message: 'just text' },
+      { type: 'object', message: '{"code":7}' },
+    ]);
   });
 
   it('keeps the owned keys owned: callers cannot override time, level, service, version or ids', () => {

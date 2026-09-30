@@ -24,6 +24,7 @@ describe('stripUrl', () => {
     ['/ingest/scrape?token=1', '/ingest/scrape'],
     ['/path#only-fragment', '/path'],
     ['not a url?x=1', 'not a url'],
+    ['http://exa mple/?token=1', 'http://exa mple/'],
     ['', ''],
   ])('%s -> %s', (input, expected) => {
     expect(stripUrl(input)).toBe(expected);

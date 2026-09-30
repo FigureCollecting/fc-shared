@@ -86,6 +86,12 @@ describe('startTracing without an endpoint (the no-op path)', () => {
     expect(after).toBe(before);
   });
 
+  it('reads process.env when given no options', () => {
+    active = startTracing('bare');
+    expect(active.state.service).toBe('bare');
+    expect(active.state.exporter).toBe(resolveTraceEndpoint(process.env) === undefined ? 'noop' : 'otlp');
+  });
+
   it('is idempotent: a second call returns the running handle', () => {
     active = startTracing('scraper', { env: {} });
     expect(startTracing('other', { env: {} })).toBe(active);
@@ -94,7 +100,10 @@ describe('startTracing without an endpoint (the no-op path)', () => {
   it('releases every global on shutdown so tracing can start again', async () => {
     const first = startTracing('first', { env: {} });
     await first.shutdown();
-    expect(inSpan(() => trace.getActiveSpan()?.isRecording())).toBe(false);
+    const orphan = trace.getTracer('after').startSpan('after-shutdown');
+    expect(orphan.isRecording()).toBe(false);
+    orphan.end();
+    expect(inSpan(() => trace.getActiveSpan())).toBeUndefined();
     const carrier: Record<string, string> = {};
     propagation.inject(context.active(), carrier);
     expect(carrier).toEqual({});

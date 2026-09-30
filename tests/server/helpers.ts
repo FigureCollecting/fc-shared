@@ -23,7 +23,9 @@ let compiled: ((data: unknown) => boolean) & { errors?: unknown } | undefined;
 function validator(): ((data: unknown) => boolean) & { errors?: unknown } {
   if (compiled === undefined) {
     const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf8')) as object;
-    const ajv = new Ajv2020({ allErrors: true, strict: true });
+    // Strict, with two standard JSON Schema idioms allowed: if/then `required` on
+    // keys the subschema does not redeclare, and a union type for extra values.
+    const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false, allowUnionTypes: true });
     compiled = ajv.compile(schema);
   }
   return compiled;

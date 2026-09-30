@@ -3,6 +3,7 @@
  * call (never the raw URL or its query), the status as code, duration_ms and the
  * caller's mesh identity as peer; the caller's traceparent is continued.
  */
+import * as http from 'node:http';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import request from 'supertest';
 import { SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
@@ -152,6 +153,22 @@ describe('httpLogMiddleware', () => {
     const all = await spans();
     expect(all).toHaveLength(1);
     expect(only(lines()).span_id).toBe(all[0].spanContext().spanId);
+  });
+});
+
+describe('httpLogMiddleware on a bare node:http server', () => {
+  it('works without express: no route template, url instead of originalUrl, default options', async () => {
+    const capture = captureSink();
+    const logger = createLogger({ service: 'probe', version: '1', env: {}, sink: capture.sink });
+    const middleware = httpLogMiddleware({ logger });
+    const server = http.createServer((req, res) =>
+      middleware(req, res, () => {
+        res.statusCode = 204;
+        res.end();
+      }),
+    );
+    await request(server).get('/plain?x=1').expect(204);
+    expect(only(capture.parsed())).toMatchObject({ event: 'http.in', call: 'GET <unmatched>', code: '204', level: 'info' });
   });
 });
 
