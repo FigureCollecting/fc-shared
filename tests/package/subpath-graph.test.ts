@@ -12,8 +12,11 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   FORBIDDEN_DEPENDENCIES,
+  LOG_SCHEMA_SUBPATH,
   PKG_NAME,
   PKG_ROOT,
+  SERVER_ONLY_SPECIFIER,
+  SERVER_SUBPATHS,
   SUBPATHS,
   ensureBuilt,
   runNodeCjs,
@@ -121,5 +124,76 @@ describe('subpath resolution and module-graph purity', () => {
       'console.info = realInfo;' +
       'console.log(JSON.stringify({ lines }));';
     expect(JSON.parse(runNodeCjs(source))).toEqual({ lines: 1 });
+  });
+});
+
+/** Every specifier Node resolves, transitively, while importing `specifier`. */
+function resolvedGraph(specifier: string): string[] {
+  const source =
+    "const { registerHooks } = require('node:module');" +
+    'const seen = [];' +
+    'registerHooks({ resolve(specifier, context, nextResolve) { const r = nextResolve(specifier, context); seen.push(specifier, r.url); return r; } });' +
+    "import('" + specifier + "').then(() => { console.log(JSON.stringify(seen)); });";
+  return JSON.parse(runNodeCjs(source)) as string[];
+}
+
+describe('node-only server subpaths', () => {
+  const cases = SERVER_SUBPATHS.map((spec) => [spec.subpath, spec] as const);
+
+  beforeAll(() => {
+    ensureBuilt();
+  }, BUILD_BUDGET_MS);
+
+  it.each(cases)('%s: loads under Node ESM and exposes its runtime values', (_subpath, spec) => {
+    const source =
+      "const m = await import('" + specifierFor(spec.subpath) + "');" +
+      'console.log(JSON.stringify(Object.keys(m)));';
+    const exported = JSON.parse(runNodeEsm(source)) as string[];
+    for (const name of spec.runtimeExports) expect(exported).toContain(name);
+  });
+
+  it.each(cases)('%s: loads under CommonJS and exposes its runtime values', (_subpath, spec) => {
+    const source =
+      "const m = require('" + specifierFor(spec.subpath) + "');" +
+      'console.log(JSON.stringify(Object.keys(m)));';
+    const exported = JSON.parse(runNodeCjs(source)) as string[];
+    for (const name of spec.runtimeExports) expect(exported).toContain(name);
+  });
+
+  it.each(cases)('%s: drags no client dependency (axios, zustand, react) into its graph', (_subpath, spec) => {
+    const resolved = resolvedGraph(specifierFor(spec.subpath));
+    for (const forbidden of FORBIDDEN_DEPENDENCIES) {
+      const hits = resolved.filter((entry) => entry === forbidden || entry.startsWith(forbidden + '/'));
+      expect({ forbidden, hits }).toEqual({ forbidden, hits: [] });
+    }
+  });
+
+  it('./server/log needs nothing beyond @opentelemetry/api at runtime', () => {
+    const packages = resolvedGraph(specifierFor('./server/log')).filter(
+      (entry) => !entry.startsWith('.') && !entry.startsWith('file:') && !entry.startsWith('node:') && !entry.startsWith(PKG_NAME)
+    );
+    expect([...new Set(packages)]).toEqual(['@opentelemetry/api']);
+  });
+
+  it('serves the log-shape schema as JSON', () => {
+    const source =
+      "const schema = require('" + specifierFor(LOG_SCHEMA_SUBPATH) + "');" +
+      'console.log(JSON.stringify(schema.$schema));';
+    expect(JSON.parse(runNodeCjs(source))).toBe('https://json-schema.org/draft/2020-12/schema');
+  });
+});
+
+describe('the browser side never reaches the server side', () => {
+  const browserEntries = ['.', ...SUBPATHS.map((spec) => spec.subpath)];
+
+  beforeAll(() => {
+    ensureBuilt();
+  }, BUILD_BUDGET_MS);
+
+  it.each(browserEntries)('%s: resolves no server module and no OpenTelemetry SDK or Connect', (subpath) => {
+    const resolved = resolvedGraph(specifierFor(subpath));
+    const serverFiles = resolved.filter((entry) => entry.includes('/dist/server/'));
+    const serverPackages = resolved.filter((entry) => SERVER_ONLY_SPECIFIER.test(entry));
+    expect({ subpath, serverFiles, serverPackages }).toEqual({ subpath, serverFiles: [], serverPackages: [] });
   });
 });

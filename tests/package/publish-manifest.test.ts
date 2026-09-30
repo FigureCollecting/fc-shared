@@ -6,7 +6,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { join, posix } from 'node:path';
-import { PKG_ROOT, SUBPATHS, ensureBuilt, runNpm } from './package-contract';
+import { LOG_SCHEMA_FILE, PKG_ROOT, SERVER_SUBPATHS, SUBPATHS, ensureBuilt, runNpm } from './package-contract';
 
 const PACK_BUDGET_MS = 600_000;
 
@@ -56,6 +56,21 @@ describe('published tarball contents', () => {
       }
     }
     expect(missing).toEqual([]);
+  });
+
+  it.each(SERVER_SUBPATHS.map((spec) => [spec.subpath, spec] as const))(
+    '%s: packs its entry points and every server chunk they import',
+    (_subpath, spec) => {
+      for (const target of [spec.types, spec.import, spec.require]) {
+        expect({ target, packed: packed.includes(target.replace('./', '')) }).toEqual({ target, packed: true });
+      }
+      const missing = esmDependencies(spec.import.replace('./', '')).filter((dep) => !packed.includes(dep));
+      expect(missing).toEqual([]);
+    }
+  );
+
+  it('packs the log-shape schema', () => {
+    expect(packed).toContain(LOG_SCHEMA_FILE.replace('./', ''));
   });
 
   it('still packs the root barrel entry points', () => {
