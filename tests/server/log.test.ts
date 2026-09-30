@@ -7,6 +7,7 @@
  */
 import { context, trace, ROOT_CONTEXT } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
+import { AxiosError, AxiosHeaders } from 'axios';
 import {
   RESERVED_LOG_KEYS,
   createLogger,
@@ -226,6 +227,21 @@ describe('server log line shape', () => {
     expect(line.login_form).toBe('{"password":"[REDACTED]"}');
     expect(lines[0]).not.toContain('hunter2');
     expectValidLine(line);
+  });
+
+  it('redacts objects passed after the message in a logger call, like the merge object', () => {
+    const { log, lines, parsed } = logger();
+    log.info('login', { password: 'hunter2', site: 'orzgk' });
+    log.error(new Error('boom'), 'failed for', { headers: { cookie: 'sid=S3CR3T-COOKIE' } });
+    log.warn('restored', new (class Session {
+      cookie = 'sid=S3CR3T-COOKIE';
+    })());
+    expect(lines.join('\n')).not.toMatch(/hunter2|S3CR3T/);
+    expect(parsed().map((line) => line.msg)).toEqual([
+      'login {"password":"[REDACTED]","site":"orzgk"}',
+      'failed for {"headers":{"cookie":"[REDACTED]"}}',
+      'restored {"cookie":"[REDACTED]"}',
+    ]);
   });
 
   it('renders err as {type, message} with the message redacted and on one line', () => {
@@ -472,6 +488,10 @@ describe('console bridge', () => {
     target.log(`[${'T'.repeat(65)}] too long for a tag`);
     target.log('[ ] blank');
     target.log('["a", "b"]');
+    // A tag starts with a letter and holds no bracket or line break.
+    target.log('[0] item');
+    target.log('[A[B] nested bracket');
+    target.log('[A\nB] line break');
     uninstall();
     expect(parsed().map((line) => [line.tag, line.msg])).toEqual([
       ['CAPTURE', 'stored 42 bytes'],
@@ -485,6 +505,9 @@ describe('console bridge', () => {
       [undefined, `[${'T'.repeat(65)}] too long for a tag`],
       [undefined, '[ ] blank'],
       [undefined, '["a","b"]'],
+      [undefined, '[0] item'],
+      [undefined, '[A[B] nested bracket'],
+      [undefined, '[A B] line break'],
     ]);
   });
 
@@ -494,10 +517,17 @@ describe('console bridge', () => {
     const uninstall = installConsoleBridge(log, target);
     target.log('[2026-09-29T12:00:00.000Z] [INFO] legacy scraper line');
     target.warn('[2026-09-29T12:00:00Z] untagged legacy line');
+    target.log('[2026-09-29T12:00:00.000+02:00] [INFO] offset timestamp');
+    target.log('[2026-09-29T12:00:00-0500] compact offset');
+    // Only a LEADING timestamp is dropped.
+    target.log('retry at [2026-09-29T12:00:00Z] done');
     uninstall();
     expect(parsed().map((line) => [line.tag, line.msg])).toEqual([
       ['INFO', 'legacy scraper line'],
       [undefined, 'untagged legacy line'],
+      ['INFO', 'offset timestamp'],
+      [undefined, 'compact offset'],
+      [undefined, 'retry at [2026-09-29T12:00:00Z] done'],
     ]);
   });
 
@@ -524,13 +554,65 @@ describe('console bridge', () => {
       'form {"password":"[REDACTED]"}',
       "login { authorization: '[REDACTED]' }",
       '{"store":"orzgk","session":{"cookie":"[REDACTED]"}}',
-      // A class instance keeps its own string form.
+      // An instance whose JSON form is a string (URL) keeps its own string form.
       'fetching https://img.store-cdn.example/a.jpg',
       '{"token":"[REDACTED]"}',
       // Walked four levels deep, like a logger field.
       '{"a":{"b":{"c":{"d":"[truncated:max-depth]"}}}}',
       'nothing null undefined 3',
     ]);
+  });
+
+  it('redacts class instances and Errors in every argument position, printf included, as logger fields are', () => {
+    class Session {
+      user = 'ross';
+      cookie = 'sid=CLASS-COOKIE-1';
+      authorization = 'Basic Q0xBU1MtQVVUSA==';
+    }
+    class StoreConfig {
+      store = 'orzgk';
+      apiKey = 'CLASS-APIKEY-2';
+    }
+    const axiosError = new AxiosError('Request failed with status code 403', 'ERR_BAD_REQUEST', {
+      url: 'https://store.example/a',
+      headers: new AxiosHeaders({ Cookie: 'cf_clearance=AXERR-COOKIE' }),
+    });
+    const plainError = Object.assign(new Error('boom'), { request: { headers: { cookie: 'sid=PLAINERR-COOKIE' } } });
+    const { log, lines, parsed } = logger();
+    const { target } = fakeConsole();
+    const uninstall = installConsoleBridge(log, target);
+    target.log('[SESSION] restored', new Session());
+    target.log(new StoreConfig());
+    target.log('%o', new Session());
+    target.log('login %s', new Session());
+    target.log('cfg %j', new StoreConfig());
+    target.log('[HTTP] request headers', new AxiosHeaders({ Cookie: 'cf_clearance=AXIOS-COOKIE-3', Authorization: 'Basic QVhJT1M=' }));
+    target.log('headers %o', new Headers({ cookie: 'sid=FETCH-HEADERS-4' }));
+    target.log('jar %o', new Map([['cookie', 'sid=MAP-COOKIE-5']]));
+    target.error('[SCRAPER API] failed %o', axiosError);
+    target.error('failed %O', plainError);
+    target.error('failed %j', plainError);
+    target.log('at %s', new Date('2026-09-29T12:00:00.000Z'));
+    uninstall();
+
+    expect(lines.join('\n')).not.toMatch(/CLASS-|AXIOS-|AXERR-|PLAINERR-|FETCH-HEADERS|MAP-COOKIE|Q0xBU1Mt|QVhJT1M/);
+    const msgs = parsed().map((line) => line.msg as string);
+    expect(msgs.slice(0, 8)).toEqual([
+      'restored {"user":"ross","cookie":"[REDACTED]","authorization":"[REDACTED]"}',
+      '{"store":"orzgk","apiKey":"[REDACTED]"}',
+      "{ user: 'ross', cookie: '[REDACTED]', authorization: '[REDACTED]' }",
+      "login { user: 'ross', cookie: '[REDACTED]', authorization: '[REDACTED]' }",
+      'cfg {"store":"orzgk","apiKey":"[REDACTED]"}',
+      'request headers {"Cookie":"[REDACTED]","Authorization":"[REDACTED]"}',
+      // fetch Headers and Map serialise to {}: nothing to show, nothing leaked.
+      'headers {}',
+      'jar {}',
+    ]);
+    // An Error is {name, message, stack} with secret-shaped values masked, never its own properties.
+    expect(msgs[8]).toMatch(/^failed \{ name: 'AxiosError', message: 'Request failed with status code 403', stack: 'AxiosError: /);
+    expect(msgs[9]).toMatch(/^failed \{ name: 'Error', message: 'boom', stack: 'Error: boom/);
+    expect(msgs[10]).toMatch(/^failed \{"name":"Error","message":"boom","stack":"Error: boom/);
+    expect(msgs[11]).toMatch(/^at .*2026/);
   });
 
   it('redacts with the default options when bridging a logger fc-shared did not create', () => {
@@ -554,8 +636,19 @@ describe('console bridge', () => {
     const { target } = fakeConsole();
     const uninstall = installConsoleBridge(log.child({ component: 'auth' }), target);
     target.log('proof', { dpopKey: 'jwk-secret', password: 'visible-under-a-custom-pattern' });
+    target.log('proof %j', { dpopKey: 'jwk-printf', password: 'visible-printf' });
+    target.log(JSON.stringify({ dpopKey: 'jwk-json', password: 'visible-json' }));
+    target.log('proof', new (class Jwk {
+      dpopKey = 'jwk-class';
+      password = 'visible-class';
+    })());
     uninstall();
-    expect(parsed()[0].msg).toBe('proof {"dpopKey":"[REDACTED]","password":"visible-under-a-custom-pattern"}');
+    expect(parsed().map((line) => line.msg)).toEqual([
+      'proof {"dpopKey":"[REDACTED]","password":"visible-under-a-custom-pattern"}',
+      'proof {"dpopKey":"[REDACTED]","password":"visible-printf"}',
+      '{"dpopKey":"[REDACTED]","password":"visible-json"}',
+      'proof {"dpopKey":"[REDACTED]","password":"visible-class"}',
+    ]);
   });
 
   it('collapses a multi-line JSON string argument to one compact line', () => {

@@ -1,9 +1,9 @@
 /**
  * Propagation allowlist (lg-logging review, SHOULD: "undici and http inject
  * traceparent into every globalThis.fetch and http request", store CDNs and
- * MFC's image host included). traceparent and baggage go ONLY to
- * cluster-internal hosts; everything else gets no trace header at all, while
- * its client span is still recorded for our own view.
+ * MFC's image host included; plan-v2 propagation_and_redaction). traceparent
+ * and baggage go ONLY to cluster-internal hosts (OTEL_PROPAGATION_ALLOWLIST);
+ * a request to any other host gets no trace header AND no auto span.
  *
  * Three layers of proof: the host matcher, the propagator on synthetic
  * contexts, and real requests (fetch in-process; node:http and fetch in a child
@@ -27,7 +27,7 @@ import { UndiciInstrumentation } from '@opentelemetry/instrumentation-undici';
 import {
   AllowlistPropagator,
   DEFAULT_PROPAGATION_HOSTS,
-  PROPAGATE_HOSTS_ENV,
+  PROPAGATION_ALLOWLIST_ENV,
   createHostAllowlist,
   propagationHostsFromEnv,
   startTracing,
@@ -85,8 +85,8 @@ describe('createHostAllowlist', () => {
     expect(custom('ingest-server.fc')).toBe(false);
   });
 
-  it('never lets a bare wildcard ("*.", "*..") allow a host', () => {
-    for (const entries of [['*.'], ['*..'], propagationHostsFromEnv({ FC_TRACE_PROPAGATE_HOSTS: '*.,*..' })]) {
+  it('never lets a bare wildcard ("*", "*.", "*..") allow a host', () => {
+    for (const entries of [['*.'], ['*..'], ['*'], propagationHostsFromEnv({ OTEL_PROPAGATION_ALLOWLIST: '*.,*..,*' })]) {
       const matcher = createHostAllowlist(entries);
       expect(matcher('img.store-cdn.example')).toBe(false);
       expect(matcher('myfigurecollection.net')).toBe(false);
@@ -95,12 +95,17 @@ describe('createHostAllowlist', () => {
     }
   });
 
-  it('extends the defaults from FC_TRACE_PROPAGATE_HOSTS, never replaces them', () => {
-    expect(PROPAGATE_HOSTS_ENV).toBe('FC_TRACE_PROPAGATE_HOSTS');
-    expect(propagationHostsFromEnv({ FC_TRACE_PROPAGATE_HOSTS: 'ingest-server, *.internal,,' })).toEqual([
-      '*.svc.cluster.local', '*.svc', 'localhost', 'ingest-server', '*.internal',
+  it('reads the list from OTEL_PROPAGATION_ALLOWLIST; unset or blank means the defaults', () => {
+    expect(PROPAGATION_ALLOWLIST_ENV).toBe('OTEL_PROPAGATION_ALLOWLIST');
+    expect(propagationHostsFromEnv({ OTEL_PROPAGATION_ALLOWLIST: 'ingest-server.fc.svc, *.internal,,' })).toEqual([
+      'ingest-server.fc.svc', '*.internal',
     ]);
     expect(propagationHostsFromEnv({})).toEqual(['*.svc.cluster.local', '*.svc', 'localhost']);
+    expect(propagationHostsFromEnv({ OTEL_PROPAGATION_ALLOWLIST: ' , ' })).toEqual(['*.svc.cluster.local', '*.svc', 'localhost']);
+    // The pre-plan name is not read.
+    expect(propagationHostsFromEnv({ FC_TRACE_PROPAGATE_HOSTS: 'img.store-cdn.example' })).toEqual([
+      '*.svc.cluster.local', '*.svc', 'localhost',
+    ]);
   });
 });
 
@@ -258,7 +263,7 @@ describe('AllowlistPropagator with real fetch (undici instrumentation, in-proces
     expect(received['/allowed'].baggage).toBe('fc.run_id=run-1');
   });
 
-  it('sends neither to a host outside the allowlist, yet records the client span without its query', async () => {
+  it('sends neither to a host outside the allowlist and records no client span for it', async () => {
     await fetchInSpan(`http://127.0.0.1:${port}/denied?sig=2`);
     expect(received['/denied']).toEqual({ traceparent: null, baggage: null });
 
@@ -267,10 +272,8 @@ describe('AllowlistPropagator with real fetch (undici instrumentation, in-proces
       .getFinishedSpans()
       .filter((span) => span.kind === SpanKind.CLIENT)
       .map((span) => [span.attributes['url.full'], span.attributes['url.query']]);
-    expect(client).toEqual([
-      [`http://localhost:${port}/allowed`, undefined],
-      [`http://127.0.0.1:${port}/denied`, undefined],
-    ]);
+    // Only the allowed request, and without its query.
+    expect(client).toEqual([[`http://localhost:${port}/allowed`, undefined]]);
   });
 });
 
@@ -353,8 +356,10 @@ describe('AllowlistPropagator with real node:http and fetch (child process, buil
     }
   });
 
-  it('records a client span for every request, with no query string exported', () => {
-    expect(result.spans).toHaveLength(6);
+  it('records client spans for the allowed hosts only, with no query string exported', () => {
+    expect(result.spans.map((span) => new URL(span.url).pathname).sort()).toEqual([
+      '/http-cluster-local', '/http-localhost', '/http-svc',
+    ]);
     for (const span of result.spans) {
       expect(span.url).not.toContain('?');
       expect(span.query).toBeNull();

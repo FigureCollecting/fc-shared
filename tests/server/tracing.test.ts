@@ -12,6 +12,8 @@ import { ROOT_CONTEXT, SpanKind, context, propagation, trace, type TracerProvide
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { W3CTraceContextPropagator } from '@opentelemetry/core';
 import type { Instrumentation } from '@opentelemetry/instrumentation';
+import { HttpInstrumentation } from '@opentelemetry/instrumentation-http';
+import { UndiciInstrumentation } from '@opentelemetry/instrumentation-undici';
 import { InMemorySpanExporter, TracerProvider, type SpanExporter } from '@opentelemetry/sdk-trace';
 import { createLogger } from '../../src/server/log';
 import {
@@ -164,14 +166,66 @@ describe('startTracing without an endpoint (the no-op path)', () => {
     expect(exporter.getFinishedSpans().map((span) => span.name)).toEqual(['from-instrumentation']);
   });
 
-  it('adds FC_TRACE_PROPAGATE_HOSTS and the propagateHosts option to the allowlist', () => {
+  it('takes the allowlist from OTEL_PROPAGATION_ALLOWLIST and adds the propagateHosts option', () => {
     active = startTracing('scraper', {
-      env: { FC_TRACE_PROPAGATE_HOSTS: 'ingest-server' },
+      env: { OTEL_PROPAGATION_ALLOWLIST: '*.svc, ingest-server' },
       propagateHosts: ['*.internal'],
     });
-    expect(active.state.propagateHosts).toEqual([
-      '*.svc.cluster.local', '*.svc', 'localhost', 'ingest-server', '*.internal',
-    ]);
+    expect(active.state.propagateHosts).toEqual(['*.svc', 'ingest-server', '*.internal']);
+    expect(injectFor('ingest-server')).toHaveProperty('traceparent');
+    expect(injectFor('a.internal')).toHaveProperty('traceparent');
+    // Replaced, not extended: a default the list left out gets nothing.
+    expect(injectFor('scraper.fc.svc.cluster.local')).toEqual({});
+  });
+
+  it('makes http and undici instrumentation skip every off-list host, keeps the caller\'s own ignore hook, and restores it on shutdown', async () => {
+    const ownHttp = jest.fn((request: { path?: string | null }) => request.path === '/own-skip');
+    const ownUndici = jest.fn((request: { path: string }) => request.path === '/own-skip');
+    const http = new HttpInstrumentation({ ignoreOutgoingRequestHook: ownHttp });
+    const undici = new UndiciInstrumentation({ ignoreRequestHook: ownUndici as never });
+    const bare = new UndiciInstrumentation();
+    const { probe, instrumentation: other } = probeInstrumentation();
+    active = startTracing('scraper', { env: {}, instrumentations: [http, undici, bare, other] });
+
+    const skipHttp = http.getConfig().ignoreOutgoingRequestHook as (request: object) => boolean;
+    expect(
+      [
+        { hostname: 'scraper.fc.svc', path: '/' },
+        { host: 'ingest-server.fc.svc.cluster.local:8080', path: '/' },
+        { path: '/' }, // node's default host: localhost
+        { hostname: 'localhost', path: '/own-skip' },
+        { hostname: 'img.store-cdn.example', path: '/a.jpg' },
+        { host: '127.0.0.1:443', path: '/' },
+        { host: '[::1]:80', path: '/' },
+        { hostname: '', host: '', path: '/' },
+      ].map(skipHttp),
+    ).toEqual([false, false, false, true, true, true, true, false]);
+    // Off-list is decided first; the caller's hook is asked only about allowed hosts.
+    expect(ownHttp.mock.calls.map(([request]) => request.path)).toEqual(['/', '/', '/', '/own-skip', '/']);
+
+    const skipUndici = undici.getConfig().ignoreRequestHook as (request: object) => boolean;
+    expect(
+      [
+        { origin: 'http://scraper.fc.svc:3050', path: '/' },
+        { origin: 'http://localhost:1', path: '/own-skip' },
+        { origin: 'https://img.store-cdn.example', path: '/a.jpg' },
+        { origin: 'http://127.0.0.1:9', path: '/' },
+        { origin: 'not a url', path: '/' },
+        { path: '/' },
+      ].map(skipUndici),
+    ).toEqual([false, true, true, true, true, true]);
+    expect(ownUndici).toHaveBeenCalledTimes(2);
+    const skipBare = bare.getConfig().ignoreRequestHook as (request: object) => boolean;
+    expect([{ origin: 'http://localhost:1', path: '/' }, { origin: 'https://img.store-cdn.example', path: '/' }].map(skipBare))
+      .toEqual([false, true]);
+    // Only http and undici are touched.
+    expect(probe.setConfig).not.toHaveBeenCalled();
+
+    await active.shutdown();
+    active = undefined;
+    expect(http.getConfig().ignoreOutgoingRequestHook).toBe(ownHttp);
+    expect(undici.getConfig().ignoreRequestHook).toBe(ownUndici);
+    expect(bare.getConfig().ignoreRequestHook).toBeUndefined();
   });
 });
 
@@ -234,6 +288,8 @@ describe('startTracing with an exporter', () => {
   });
 
   it('bounds forceFlush AND shutdown by exportTimeoutMillis when the collector accepts and never answers', async () => {
+    const DEADLINE_MS = 400;
+    const SLACK_MS = 400;
     const sockets: net.Socket[] = [];
     const blackHole = net.createServer((socket) => {
       sockets.push(socket);
@@ -243,7 +299,7 @@ describe('startTracing with an exporter', () => {
     try {
       active = startTracing('scraper', {
         env: { OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}` },
-        batch: { exportTimeoutMillis: 300 },
+        batch: { exportTimeoutMillis: DEADLINE_MS },
       });
       inSpan(() => undefined);
       let started = performance.now();
@@ -255,7 +311,12 @@ describe('startTracing with an exporter', () => {
       const shutdownMs = performance.now() - started;
 
       expect(sockets.length).toBeGreaterThan(0);
-      expect({ flushMs: flushMs < 2_000, shutdownMs: shutdownMs < 2_000 }).toEqual({ flushMs: true, shutdownMs: true });
+      // The flush gives up at the deadline. The OTLP call has the SAME deadline, so it is over by
+      // then and shutdown has nothing left to wait for; a longer exporter deadline would hold it.
+      expect({ flushMs: Math.round(flushMs), shutdownMs: Math.round(shutdownMs) }).toEqual({
+        flushMs: expect.toBeWithin(0, DEADLINE_MS + SLACK_MS),
+        shutdownMs: expect.toBeWithin(0, SLACK_MS),
+      });
     } finally {
       sockets.forEach((socket) => socket.destroy());
       await new Promise((resolve) => blackHole.close(resolve));
@@ -311,10 +372,14 @@ describe('startTracing when another OpenTelemetry setup registered first', () =>
     trace.setGlobalTracerProvider(new TracerProvider());
     const exporter = new InMemorySpanExporter();
     const exporterShutdown = jest.spyOn(exporter, 'shutdown');
+    const undici = new UndiciInstrumentation();
 
-    expect(() => startTracing('scraper', { env: {}, exporter })).toThrow(
+    expect(() => startTracing('scraper', { env: {}, exporter, instrumentations: [undici] })).toThrow(
       /OpenTelemetry globals already registered: propagation, trace/,
     );
+    // Nothing of its own is left behind on the instrumentations either.
+    expect(undici.getConfig().ignoreRequestHook).toBeUndefined();
+    undici.disable();
     // Its own context manager was released again, and its provider shut down...
     expect(context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable())).toBe(true);
     await new Promise((resolve) => setImmediate(resolve));
