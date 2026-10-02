@@ -291,13 +291,17 @@ function maskHeaderLines(text: string, redact: RedactOptions): string {
   );
 }
 
-/** A form key decoded (%XX), as a server reads it; one that does not decode, as written. */
+/** A run of %XX escapes. */
+const ESCAPES = /(?:%[0-9A-Fa-f]{2})+/g;
+
+/**
+ * A form key as a server reads it: each run of %XX escapes decoded as UTF-8,
+ * a byte that is not UTF-8 read as U+FFFD, a '%' that starts no escape kept.
+ * Never an exception, so a key that does not decode costs what one that does
+ * costs (decodeURIComponent throws for each).
+ */
 function formKey(raw: string): string {
-  try {
-    return decodeURIComponent(raw);
-  } catch {
-    return raw;
-  }
+  return raw.replace(ESCAPES, (run) => Buffer.from(run.replaceAll('%', ''), 'hex').toString('utf8'));
 }
 
 /**
@@ -368,8 +372,8 @@ function freshBudget(): Budget {
  * an object is and re-emitted compact, up to four strings deep (a fifth prints
  * the depth marker, never its text), its entries counted in the budget of the
  * value around it; past that budget it prints the entries marker, unparsed.
- * Any other text goes through plainText, then, as a URL value (inUrl), is cut
- * at its first ? or #.
+ * Any other text goes through plainText; a URL value (inUrl) is first cut at
+ * its first ? or #, so no rule reads its query.
  */
 function redactText(text: string, redact: RedactOptions, nesting = 0, inUrl = false, budget = freshBudget()): string {
   const candidate = jsonCandidate(text);
@@ -385,8 +389,8 @@ function redactText(text: string, redact: RedactOptions, nesting = 0, inUrl = fa
   const doc = candidate === undefined ? undefined : jsonDocument(candidate);
   let out: string;
   if (doc === undefined) {
-    const plain = plainText(text, redact);
-    out = inUrl ? plain.split(/[?#]/)[0].trim() : plain;
+    // A URL value's query is never printed, so it is cut before any rule reads it.
+    out = inUrl ? plainText(text.split(/[?#]/, 1)[0], redact).trim() : plainText(text, redact);
   } else {
     out = nesting < MAX_FIELD_DEPTH ? JSON.stringify(printValue(doc, redact, nesting + 1, inUrl, budget)) : TRUNCATED;
   }

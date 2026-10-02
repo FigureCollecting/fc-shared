@@ -140,12 +140,14 @@ also cut at its first `?` or `#`.
 - a value under a URL-named key (`url`, `uri`, `href`, `link`, `path`,
   `target`, `endpoint`, `location`, `referer`, `redirect`, their plurals, and
   keys made of them such as `imageUrl` or `redirect_uri`), at any depth and
-  through arrays and objects under it, is cut at its first `?` or `#`;
+  through arrays and objects under it, is cut at its first `?` or `#` before
+  any other rule reads it;
 - a header line (`Cookie: ...` at the start of a line) and a raw header list
   (`rawHeaders`: name, value, ...) have each sensitive header's value masked;
 - a value that is wholly a form-encoded list (`key=value&key=value`, no
   whitespace, as axios sends a `URLSearchParams` body) has the value of each
-  sensitive key (read decoded, so `api%5Fkey` is `api_key`) masked;
+  sensitive key masked, the key read as a server reads it (`api%5Fkey` is
+  `api_key`; an escape that is not UTF-8 is read as U+FFFD, never an error);
 - a string that is, as a whole, a JSON object or array is key-redacted and
   made compact (JSON inside such a string too, up to four levels);
 - an object is key-redacted in its JSON form (`toJSON` honoured): an Error
