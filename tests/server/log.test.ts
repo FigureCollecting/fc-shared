@@ -1038,6 +1038,21 @@ describe('URLs in log output lose their query, fragment and userinfo (plan-v2 pr
     expect(lines[0]).not.toContain('SECRET');
   });
 
+  it("never reads a URL value's query: the value is cut at its first ? or # before any rule reads it", () => {
+    const query = 'q=%=&'.repeat(1600);
+    const { log, parsed } = logger();
+    const read = jest.spyOn(sanitize, 'redactString');
+    let queries = -1;
+    try {
+      log.info({ url: `/search?${query}`, page: { links: [`next#${query}`] } });
+      queries = read.mock.calls.filter(([text]) => text.includes('q=%=')).length;
+    } finally {
+      read.mockRestore();
+    }
+    expect(queries).toBe(0);
+    expect(parsed()[0]).toMatchObject({ url: '/search', page: '{"links":["next"]}' });
+  });
+
   it('cuts URL-named keys in bridged and printf arguments and in the text format', () => {
     const { target, uninstall, lines, msgs } = bridged();
     target.log('%o', { url: 'login?access_token=SECRET1' });
@@ -1537,6 +1552,49 @@ describe('a form-encoded body (key=value&key=value) has each sensitive value mas
     const out = parsed();
     expect(out[0]).toMatchObject({ list: 'a=1&b=2', prose: 'retry with password=visible', word: 'token', base64: 'aGk=' });
     expect(out[1]).toMatchObject({ flag: 'a=1&passwordless', padded: ' a=1&b=2 ' });
+  });
+
+  it('reads each key as a server does: a run of escapes decoded as UTF-8, a byte that is not UTF-8 replaced', () => {
+    const { log, lines, parsed } = logger();
+    log.info({
+      escaped: '%74oken=hunter13&a=1',
+      runs: '%61pi%5fkey=hunter17&a=1',
+      invalid: '%E0=1&token=hunter14',
+      gaps: 'a=1&&token=hunter15&',
+    });
+    // A key pattern of the service's own, beyond ASCII: 'contrase%c3%b1a' is 'contraseña' only read as one run.
+    const custom = logger({ redact: { sensitiveKeyPattern: /contraseña/ } });
+    custom.log.info({ body: 'usuario=u&contrase%c3%b1a=hunter16' });
+    expect([...lines, ...custom.lines].join('\n')).not.toMatch(/hunter/);
+    expect(parsed()[0]).toMatchObject({
+      escaped: '%74oken=[REDACTED]&a=1',
+      runs: '%61pi%5fkey=[REDACTED]&a=1',
+      invalid: '%E0=1&token=[REDACTED]',
+      gaps: 'a=1&&token=[REDACTED]&',
+    });
+    expect(custom.parsed()[0].body).toBe('usuario=u&contrase%c3%b1a=[REDACTED]');
+  });
+
+  it('reads 8 KB of keys that do not decode without an exception per key', () => {
+    // decodeURIComponent throws for a bare '%' and for an escape that is not UTF-8. 8 KB is what is left of a value
+    // after the 8,192-character cap; Fastify logs a request's URL on every request.
+    const original = decodeURIComponent;
+    let throws = 0;
+    const decode = jest.spyOn(globalThis, 'decodeURIComponent').mockImplementation((text: string) => {
+      try {
+        return original(text);
+      } catch (error) {
+        throws += 1;
+        throw error;
+      }
+    });
+    const { log } = logger();
+    try {
+      log.info({ bare: '%=&'.repeat(2666), invalid: '%E0=1&'.repeat(1333) });
+    } finally {
+      decode.mockRestore();
+    }
+    expect(throws).toBe(0);
   });
 
   it('masks a real axios URLSearchParams body in config.data, logged as the axios README logs error.config', async () => {
