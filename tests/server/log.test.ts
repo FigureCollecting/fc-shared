@@ -19,6 +19,7 @@ import {
   toSnakeCase,
   type Logger,
 } from '../../src/server/log';
+import * as sanitize from '../../src/utils/sanitize';
 import { SPAN_ID, TRACE_ID, captureSink, expectValidLine, withRemoteSpan } from './helpers';
 
 const contextManager = new AsyncLocalStorageContextManager();
@@ -391,6 +392,36 @@ describe('server log levels, identity and bindings', () => {
     expect(lines[0]).toMatchObject({ site: 'orzgk', item_id: 7, event: 'item.process', level: 'debug' });
     expect(grandchild.level).toBe('debug');
     expectValidLine(lines[0]);
+  });
+
+  it('a child given an empty or unknown level keeps its parent level, as pino does (Fastify 5 passes level "")', () => {
+    const { log, parsed } = logger({ level: 'warn' });
+    // The logger as Fastify's types hold it (pino's BaseLogger): child options whose level is any string.
+    interface PinoChild {
+      child(bindings: Record<string, unknown>, options?: { level?: string }): Logger;
+    }
+    const pinoLike: PinoChild = log;
+    const request = pinoLike.child({ reqId: 'req-1' }, { level: '' });
+    const unknown = pinoLike.child({}, { level: 'verbose' });
+    const inherited = pinoLike.child({}, { level: 'constructor' });
+    const spaced = pinoLike.child({}, { level: ' DEBUG ' });
+    request.warn('incoming request');
+    request.info('hidden');
+    unknown.warn('unknown');
+    inherited.warn('inherited');
+    inherited.info('hidden');
+    spaced.debug('spaced');
+    expect([request.level, unknown.level, inherited.level, spaced.level]).toEqual(['warn', 'warn', 'warn', 'debug']);
+    expect(parsed().map((line) => line.msg)).toEqual(['incoming request', 'unknown', 'inherited', 'spaced']);
+    expect(parsed()[0].req_id).toBe('req-1');
+  });
+
+  it('reads a LOG_LEVEL that names an Object property (constructor) as unknown', () => {
+    const junk = logger({ env: { LOG_LEVEL: 'constructor' } });
+    junk.log.debug('hidden');
+    junk.log.info('shown');
+    expect(junk.parsed().map((line) => line.msg)).toEqual(['shown']);
+    expect(junk.log.level).toBe('info');
   });
 
   it('stamps job from JOB_NAME (downward API) on every line', () => {
@@ -900,6 +931,19 @@ describe('URLs in log output lose their query, fragment and userinfo (plan-v2 pr
     ],
     ['a Windows-style path', 'dir\\sub\\file.txt?sig=SECRET', 'dir\\sub\\file.txt'],
     ['a padded bare query string', '  ?token=SECRET ', ''],
+    // Cut at the FIRST ? or #, whichever comes first. (Keys that are not sensitive, so the form rule cannot mask them.)
+    ['a path with a query, then a fragment', '/login?q=SECRET#frag', '/login'],
+    ['a path with a fragment, then a query', '/cb#state=SECRET?x=1', '/cb'],
+    ['a request target with a fragment, then a query', 'GET /x#SECRET?y HTTP/1.1', 'GET /x HTTP/1.1'],
+    // A first token of any shape, when key=value pairs follow its ? or #.
+    ['a single-label host with a query', 'scraper?q=SECRET', 'scraper'],
+    ['an IPv6 host and port with a query', '[::1]:8080?sig=SECRET', '[::1]:8080'],
+    ['an internationalised host with a query', 'bücher.example?sig=SECRET', 'bücher.example'],
+    ['a single-label host with key=value pairs in a fragment', 'scraper#state=SECRET', 'scraper'],
+    ['a protocol-relative URL inside text', 'see //cdn.example/a?sig=SECRET now', 'see //cdn.example/a now'],
+    // Fastify's default not-found message: the method and the URL joined by a colon.
+    ['a method and target joined by a colon', 'Route GET:/nothere?sig=SECRET not found', 'Route GET:/nothere not found'],
+    ['a colon-joined target with a fragment, then a query', 'Route GET:/x#SECRET?y not found', 'Route GET:/x not found'],
     ...['HEAD', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH'].map((method) => [
       `a ${method} request line`,
       `${method} /x?sig=SECRET HTTP/1.1`,
@@ -933,6 +977,11 @@ describe('URLs in log output lose their query, fragment and userinfo (plan-v2 pr
     ['a numbered note holding an =', '#1 retry with x=2'],
     ['a method name inside a word', 'BUDGET /items?page=2 later'],
     ['a word that starts with a method name', 'POSTER? no'],
+    ['a question, then key=value text', 'why? x=1'],
+    ['a question, then a query further on', 'ok? see a?b=1'],
+    ['a word and a question mark with no key=value after it', 'scraper?ok'],
+    ['a comment marker inside text', 'see a // b?c'],
+    ['a method name and a colon in prose', 'GET: why?'],
   ])('leaves %s alone', (_label, value) => {
     const { log, parsed } = logger();
     log.info({ note: value });
@@ -1004,13 +1053,68 @@ describe('URLs in log output lose their query, fragment and userinfo (plan-v2 pr
   it('strips URLs used as object keys, nested and at the top level', () => {
     const { log, lines, parsed } = logger();
     log.info({
-      statuses: { 'https://cdn.example/a.jpg?X-Amz-Signature=SECRET1': 403, plain: 200 },
-      'https://cdn.example/b.jpg?sig=SECRET2': 404,
+      // Query values with no sensitive word, so the key's own words do not mask the value.
+      statuses: { 'https://cdn.example/a.jpg?X-Amz-Signature=hunter1': 403, plain: 200 },
+      'https://cdn.example/b.jpg?sig=hunter2': 404,
     });
     const [line] = parsed();
     expect(line.statuses).toBe('{"https://cdn.example/a.jpg":403,"plain":200}');
     expect(line.https_cdn_example_b_jpg).toBe(404);
-    expect(lines[0]).not.toMatch(/secret/i);
+    expect(lines[0]).not.toMatch(/hunter/);
+  });
+
+  it('masks the value of a key that names a secret before its query is cut, nested and at the top level', () => {
+    const { log, lines, parsed } = logger();
+    // 'api key' names a secret only once printed (api_key): that decides too.
+    log.info({ cache: { '/login?password': 'hunter1', '/a?page': 2 }, '/login?token': 'hunter2', 'api key': 'hunter3' });
+    const [line] = parsed();
+    expect(line.cache).toBe('{"/login":"[REDACTED]","/a":2}');
+    expect(line).toMatchObject({ login: '[REDACTED]', api_key: '[REDACTED]' });
+    expect(lines[0]).not.toContain('hunter');
+  });
+
+  it("prints err.type, an Error's name, as any value is", () => {
+    const { log, lines, parsed } = logger();
+    const named = new Error('m');
+    named.name = 'https://h.example/a?sig=hunter3';
+    log.error({ err: named });
+    expect(parsed()[0].err).toEqual({ type: 'https://h.example/a', message: 'm' });
+    expect(lines[0]).not.toContain('hunter3');
+  });
+
+  it('prints nested object keys through the secret-shape and header-line rules', () => {
+    const { log, lines, parsed } = logger();
+    log.info({ deep: { 'Bearer abcdefghijklmnop': 1, 'Cookie: sid=hunter7': 2 } });
+    // Both keys name a secret (a bearer token, a cookie), so their values are masked too.
+    expect(parsed()[0].deep).toBe('{"[REDACTED]":"[REDACTED]","Cookie: [REDACTED]":"[REDACTED]"}');
+    expect(lines[0]).not.toMatch(/abcdefghijklmnop|hunter7/);
+  });
+
+  it('prints a framework wrapper around a node HTTP message (Fastify Request, Reply) as that message', async () => {
+    const { log, lines, parsed } = logger();
+    const server = http.createServer((req, res) => {
+      // Fastify's Request and Reply keep node's message in raw, the parsed query beside it.
+      const request = { id: 'req-1', params: { id: '1' }, raw: req, query: { sig: 'QSIG-SECRET' }, log };
+      const reply = { raw: res, request, log };
+      log.info({ req: request }, 'incoming request');
+      log.info({ res: reply, responseTime: 1.5 }, 'request completed');
+      // First, a wrapper is a message part (as a stream is), not a merge object.
+      log.info(request, 'incoming');
+      res.end('ok');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    const response = await new Promise<http.IncomingMessage>((resolve) => {
+      http.get(`http://127.0.0.1:${port}/items/1?sig=URL-SECRET`, resolve);
+    });
+    response.resume();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    expect(lines.join('\n')).not.toMatch(/[A-Z]+-SECRET/);
+    const [incoming, completed, first] = parsed();
+    expect(incoming.req).toBe('{"method":"GET","url":"/items/1"}');
+    expect(completed).toMatchObject({ res: '{"statusCode":200}', response_time: 1.5 });
+    expect(first.msg).toBe('{"method":"GET","url":"/items/1"} incoming');
+    expect(first).not.toHaveProperty('query');
   });
 
   it('prints a query holding an apostrophe without it in msg, err.message, bridged and text output', () => {
@@ -1283,6 +1387,182 @@ describe('JSON strings are key-redacted wherever they are printed', () => {
   });
 });
 
+describe("an Error's message is printed by the one policy wherever it appears", () => {
+  const JSON_MESSAGE = JSON.stringify({ user: 'u', password: 'hunter2' });
+  const REDACTED_JSON = '{"user":"u","password":"[REDACTED]"}';
+  /** The start of an Error printed as an object, through to its first stack frame. */
+  const errorHead = (message: unknown, stackHead: string, name = 'Error'): string =>
+    JSON.stringify({ name, message, stack: `${stackHead}\n    at ` }).slice(0, -2);
+  const start = (value: unknown, length: number): string => String(value).slice(0, length);
+
+  it('in console.error(err) and an Error message part, as in err.message', () => {
+    const { log, target, uninstall, lines, parsed, msgs } = bridged();
+    target.error(new Error(JSON_MESSAGE));
+    target.error(new Error('/api/lookup?token=hunter3'));
+    target.error(new Error('Cookie: sid=hunter4'));
+    log.info('failed:', new Error(JSON_MESSAGE));
+    log.warn('retry after', new Error('/api/lookup?token=hunter3'));
+    log.error('during', new Error('Cookie: sid=hunter4'));
+    log.info('empty', new Error(''));
+    uninstall();
+    expect(msgs()).toEqual([
+      `Error: ${REDACTED_JSON}`,
+      'Error: /api/lookup',
+      'Error: Cookie: [REDACTED]',
+      `failed: ${REDACTED_JSON}`,
+      'retry after /api/lookup',
+      'during Cookie: [REDACTED]',
+      'empty Error (no message)',
+    ]);
+    expect(parsed().slice(0, 3).map((line) => line.err)).toEqual([
+      { type: 'Error', message: REDACTED_JSON },
+      { type: 'Error', message: '/api/lookup' },
+      { type: 'Error', message: 'Cookie: [REDACTED]' },
+    ]);
+    expect(lines.join('\n')).not.toMatch(/hunter/);
+  });
+
+  it('in the stack of an Error printed as an object: a field, nested, and under %s, %o, %O and %j', () => {
+    const { log, target, uninstall, lines, parsed, msgs } = bridged();
+    log.info({ cause: new Error(JSON_MESSAGE) });
+    log.info({ attempt: { cause: new Error('Cookie: sid=hunter4') } });
+    target.error('failed %s', new Error(JSON_MESSAGE));
+    target.error('failed %o', new Error('/api/lookup?token=hunter3'));
+    target.error('failed %O', new Error('Cookie: sid=hunter4'));
+    target.error('failed %j', new Error(JSON_MESSAGE));
+    uninstall();
+    expect(lines.join('\n')).not.toMatch(/hunter/);
+    const [cause, attempt] = parsed();
+    const head = errorHead(REDACTED_JSON, `Error: ${REDACTED_JSON}`);
+    expect(start(cause.cause, head.length)).toBe(head);
+    const nested = `{"cause":${errorHead('Cookie: [REDACTED]', 'Error: Cookie: [REDACTED]')}`;
+    expect(start(attempt.attempt, nested.length)).toBe(nested);
+    const printf = [
+      `failed { name: 'Error', message: '${REDACTED_JSON}', stack: 'Error: ${REDACTED_JSON}\\n    at `,
+      "failed { name: 'Error', message: '/api/lookup', stack: 'Error: /api/lookup\\n    at ",
+      "failed { name: 'Error', message: 'Cookie: [REDACTED]', stack: 'Error: Cookie: [REDACTED]\\n    at ",
+      `failed ${head}`,
+    ];
+    expect(msgs().slice(2).map((msg, index) => start(msg, printf[index].length))).toEqual(printf);
+  });
+
+  it("keeps a stack's own header (a node error code) and rewrites one that no longer matches the message", () => {
+    // Node's own errors put their code in the header: 'RangeError [ERR_OUT_OF_RANGE]: The value of ...'. (A node
+    // core error is from another realm under jest, so this one is made here, with node's header.)
+    const coded = Object.assign(new RangeError('Cookie: sid=hunter5'), { code: 'ERR_EXAMPLE' });
+    coded.stack = 'RangeError [ERR_EXAMPLE]: Cookie: sid=hunter5\n    at check (/app/dist/index.js:1:1)';
+    const stale = new Error('Cookie: sid=hunter6');
+    void stale.stack; // V8 writes the stack's header when it is first read.
+    stale.message = 'wrapped';
+    const custom = Object.assign(new Error('m'), { stack: 'trace from /login?token=hunter7' });
+    const emptied = new Error('Cookie: sid=hunter9: ');
+    void emptied.stack;
+    emptied.message = '';
+    const suffix = new Error('rotate password=hunter10 then retry');
+    void suffix.stack;
+    suffix.message = 'then retry';
+    const bare = new Error('Cookie: sid=hunter11');
+    delete (bare as { stack?: string }).stack;
+    const odd = new Error('x');
+    (odd as { message: unknown }).message = { password: 'hunter8' };
+    const { log, target, uninstall, lines, parsed, msgs } = bridged();
+    log.info({ coded, stale, custom, odd, emptied, suffix, bare });
+    target.error('odd', odd);
+    log.info('odd', odd);
+    uninstall();
+    expect(lines.join('\n')).not.toMatch(/hunter/);
+    const [line] = parsed();
+    expect(line.coded).toBe(
+      JSON.stringify({ name: 'RangeError', message: 'Cookie: [REDACTED]', stack: 'RangeError [ERR_EXAMPLE]: Cookie: [REDACTED]\n    at check (/app/dist/index.js:1:1)' }),
+    );
+    const staleHead = errorHead('wrapped', 'Error: wrapped');
+    expect(start(line.stale, staleHead.length)).toBe(staleHead);
+    expect(line.custom).toBe('{"name":"Error","message":"m","stack":"Error: m"}');
+    const oddHead = errorHead({ password: '[REDACTED]' }, 'Error');
+    expect(start(line.odd, oddHead.length)).toBe(oddHead);
+    // An empty message: V8's header is the name alone.
+    const emptiedHead = errorHead('', 'Error');
+    expect(start(line.emptied, emptiedHead.length)).toBe(emptiedHead);
+    // The header ends with the new message, but not after ': ', so it is not the header V8 wrote for it.
+    const suffixHead = errorHead('then retry', 'Error: then retry');
+    expect(start(line.suffix, suffixHead.length)).toBe(suffixHead);
+    expect(line.bare).toBe('{"name":"Error","message":"Cookie: [REDACTED]"}');
+    expect(msgs().slice(1)).toEqual(['odd Error: {"password":"[REDACTED]"}', 'odd {"password":"[REDACTED]"}']);
+  });
+
+  it("keeps every line of a multi-line message in the stack's header, one holding ' at ' too", () => {
+    const { log, lines, parsed } = logger();
+    log.info({ cause: new Error('Cookie: sid=hunter12\nfailed at noon') });
+    expect(lines[0]).not.toContain('hunter12');
+    const head = errorHead('Cookie: [REDACTED]\nfailed at noon', 'Error: Cookie: [REDACTED]\nfailed at noon');
+    expect(start(parsed()[0].cause, head.length)).toBe(head);
+  });
+
+  it("prints an Error's stack under a URL-named key as its message is, a URL value", () => {
+    const { log, lines, parsed } = logger();
+    log.info({ url: new Error('see docs?sig=hunter1') });
+    expect(lines[0]).not.toContain('hunter1');
+    const head = errorHead('see docs', 'Error: see docs');
+    expect(start(parsed()[0].url, head.length)).toBe(head);
+  });
+});
+
+describe('a form-encoded body (key=value&key=value) has each sensitive value masked', () => {
+  const FORM = 'grant_type=password&username=u&password=hunter5&client_secret=hunter6';
+  const MASKED = 'grant_type=password&username=u&password=[REDACTED]&client_secret=[REDACTED]';
+
+  it('as a field, nested, a message, a message part, and a bridged or printf argument', () => {
+    const { log, target, uninstall, lines, parsed, msgs } = bridged();
+    log.warn({ config: { url: '/oauth/token', data: FORM } });
+    log.info({ body: 'api%5Fkey=hunter7&session%2Did=hunter8&a=1', odd: '%E0%A4%A=1&token%=hunter9&=x&flag' });
+    log.info(FORM);
+    log.info('sent', FORM);
+    target.log('sent', FORM);
+    target.log('sent %s', FORM);
+    target.log({ data: `  ${FORM}\n` });
+    uninstall();
+    expect(lines.join('\n')).not.toMatch(/hunter/);
+    const out = parsed();
+    expect(out[0].config).toBe(JSON.stringify({ url: '/oauth/token', data: MASKED }));
+    // A key is read decoded (api_key, session-id); one that does not decode is read as written.
+    expect(out[1]).toMatchObject({ body: 'api%5Fkey=[REDACTED]&session%2Did=[REDACTED]&a=1', odd: '%E0%A4%A=1&token%=[REDACTED]&=x&flag' });
+    expect(msgs().slice(2)).toEqual([MASKED, `sent ${MASKED}`, `sent ${MASKED}`, `sent ${MASKED}`, JSON.stringify({ data: MASKED })]);
+  });
+
+  it('leaves text that is not wholly a form alone', () => {
+    const { log, parsed } = logger();
+    log.info({ list: 'a=1&b=2', prose: 'retry with password=visible', word: 'token', base64: 'aGk=' });
+    // A pair with no '=' has no key to read; a form with nothing to mask keeps its padding.
+    log.info({ flag: 'a=1&passwordless', padded: ' a=1&b=2 ' });
+    const out = parsed();
+    expect(out[0]).toMatchObject({ list: 'a=1&b=2', prose: 'retry with password=visible', word: 'token', base64: 'aGk=' });
+    expect(out[1]).toMatchObject({ flag: 'a=1&passwordless', padded: ' a=1&b=2 ' });
+  });
+
+  it('masks a real axios URLSearchParams body in config.data, logged as the axios README logs error.config', async () => {
+    const server = http.createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        res.statusCode = 401;
+        res.end('no');
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    const body = new URLSearchParams({ grant_type: 'password', username: 'ross', password: 'FORMPW-SECRET', client_secret: 'CSECRET-SECRET' });
+    const err = (await axios.post(`http://127.0.0.1:${port}/oauth/token`, body).catch((error: unknown) => error)) as AxiosError;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    expect(err).toBeInstanceOf(AxiosError);
+    expect(err.config?.data).toBe('grant_type=password&username=ross&password=FORMPW-SECRET&client_secret=CSECRET-SECRET');
+    const { log, target, uninstall, lines, parsed } = bridged();
+    log.warn({ data: err.config?.data }, 'token request failed');
+    target.log(err.config);
+    uninstall();
+    expect(lines.join('\n')).not.toMatch(/[A-Z]+-SECRET/);
+    expect(parsed()[0].data).toBe('grant_type=password&username=ross&password=[REDACTED]&client_secret=[REDACTED]');
+  });
+});
+
 describe('an object that hides itself from util.inspect prints as its class name', () => {
   class Credential {
     constructor(public value: string) {}
@@ -1401,6 +1681,105 @@ describe('printing a value never throws and stays bounded', () => {
     log.info({ exact: exact.list, over: over.list });
     expect(exact.reads.count).toBeGreaterThan(0);
     expect(over.reads.count).toBe(0);
+  });
+
+  it('reads a JSON string once per printed value, however many times the value refers to it', () => {
+    // Spaced, so the parse of each source string is told apart from the logger's own compact round trip.
+    const inner = '[1, 2]';
+    const outer = JSON.stringify([inner, inner, inner], null, 1);
+    const { log, parsed } = logger();
+    const parse = jest.spyOn(JSON, 'parse');
+    let documents = -1;
+    try {
+      log.info({ v: [outer, outer, outer] });
+      documents = parse.mock.calls.filter(([text]) => text === inner || text === outer).length;
+    } finally {
+      parse.mockRestore();
+    }
+    expect(documents).toBe(2);
+    expect(parsed()[0].v).toBe(JSON.stringify(new Array<string>(3).fill('["[1,2]","[1,2]","[1,2]"]')));
+  });
+
+  it('counts JSON held in strings against the same 1000 entries as the value around it, a reused one each time', () => {
+    // 20 different JSON strings of 99 entries inside one JSON string: 20 + 9 * 99 = 911 entries read, the
+    // tenth string goes past 1000 (it prints the marker) and the other ten are never parsed.
+    const different = Array.from({ length: 20 }, (_, n) => JSON.stringify(new Array<number>(99).fill(n), null, 1));
+    // One such string 20 times: read once, then reused at 99 entries each until the budget is short.
+    const reused = JSON.stringify(new Array<string>(99).fill('x'), null, 1);
+    const { log } = logger();
+    const parse = jest.spyOn(JSON, 'parse');
+    let counts: number[] = [];
+    try {
+      log.info({ different: JSON.stringify(different), reused: JSON.stringify(new Array<string>(20).fill(reused)) });
+      const texts = parse.mock.calls.map(([text]) => text as unknown);
+      counts = [texts.filter((text) => different.includes(text as string)).length, texts.filter((text) => text === reused).length];
+    } finally {
+      parse.mockRestore();
+    }
+    // reused: 20 + 99 read, 8 reuses (911 in all), then too few entries are left to reuse it: read once more.
+    expect(counts).toEqual([10, 2]);
+  });
+
+  it('still reads a JSON string reached with no entries left, when it needs none', () => {
+    // 11 + 9 * 100 + 89 = 1000 entries: the budget is exactly spent when the JSON string comes.
+    const empty = ' [ ]';
+    const { log } = logger();
+    const parse = jest.spyOn(JSON, 'parse');
+    let reads = -1;
+    try {
+      log.info({ v: [...Array.from({ length: 9 }, () => new Array<number>(100).fill(0)), new Array<number>(89).fill(0), empty] });
+      reads = parse.mock.calls.filter(([text]) => text === empty.trim()).length;
+    } finally {
+      parse.mockRestore();
+    }
+    expect(reads).toBe(1);
+  });
+
+  it("counts a JSON string's entries against the object around it", () => {
+    // 2 + 9 + 9 * 100 = 911 entries before body; body's 90 go past 1000, so the JSON string inside it is never read.
+    const inner = ' [1, 2]';
+    const body = JSON.stringify([inner, ...new Array<number>(89).fill(0)]);
+    const { log } = logger();
+    const parse = jest.spyOn(JSON, 'parse');
+    let reads = -1;
+    try {
+      log.info({ v: { list: Array.from({ length: 9 }, () => new Array<number>(100).fill(0)), body } });
+      reads = parse.mock.calls.filter(([text]) => text === inner.trim()).length;
+    } finally {
+      parse.mockRestore();
+    }
+    expect(reads).toBe(0);
+  });
+
+  it('reuses a printed string only as the same kind of value at the same depth', () => {
+    const { log, parsed } = logger();
+    // As a URL value the text is cut at its ?; as plain text it is kept.
+    log.info({ v: { link: 'page 2?cursor=abc', note: 'page 2?cursor=abc' } });
+    // The same JSON string one level down and four levels down (where JSON is no longer read).
+    const same = '[1]';
+    log.info({ v: JSON.stringify([same, JSON.stringify([JSON.stringify([JSON.stringify([same])])])]) });
+    const out = parsed();
+    expect(out[0].v).toBe('{"link":"page 2","note":"page 2?cursor=abc"}');
+    expect(out[1].v).toBe(JSON.stringify([same, JSON.stringify([JSON.stringify([JSON.stringify(['[truncated:max-depth]'])])])]));
+  });
+
+  it('prints a reused plain string once per printed value, past the budget too', () => {
+    // Ten JSON strings of 99 entries use the budget up; the 50 references to one plain string after them are
+    // printed from the first printing. Its secret shape changes it, so the final key-redaction pass reads
+    // only the printed text.
+    const plain = `Bearer abcdefghijklmnop ${'x'.repeat(1000)}`;
+    const docs = Array.from({ length: 11 }, (_, n) => JSON.stringify(new Array<number>(99).fill(n)));
+    const { log, lines } = logger();
+    const read = jest.spyOn(sanitize, 'redactString');
+    let reads = -1;
+    try {
+      log.info({ v: [...docs, ...new Array<string>(50).fill(plain)] });
+      reads = read.mock.calls.filter(([text]) => text === plain).length;
+    } finally {
+      read.mockRestore();
+    }
+    expect(reads).toBe(1);
+    expect(lines[0]).not.toContain('abcdefghijklmnop');
   });
 
   it('prints an object it cannot read as [unserializable], per value', () => {
@@ -1534,6 +1913,17 @@ describe('printing a value never throws and stays bounded', () => {
       `keys ${JSON.stringify(keys(100))}`,
     ]);
     expect(parsed()[4].page).toBe(JSON.stringify({ rows: [...first99, '[truncated:901 more]'] }));
+  });
+
+  it('strips request targets in linear time: a run of "GET:" never rescans the text after it', () => {
+    // 400 different 8,000-character message parts (under the 8,192 cap): about 2 s when each GET: rescans the rest
+    // of its part (quadratic), tens of ms in linear time. The bound leaves a wide margin both ways.
+    const parts = Array.from({ length: 400 }, (_, index) => `${'GET:'.repeat(2000)}${index}`);
+    const { log, parsed } = logger();
+    const started = performance.now();
+    log.info(...parts);
+    expect(performance.now() - started).toBeLessThan(500);
+    expect((parsed()[0].msg as string).startsWith('GET:GET:')).toBe(true);
   });
 
   it('never reads an object past the fourth level', () => {
