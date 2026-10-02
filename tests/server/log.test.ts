@@ -1585,6 +1585,10 @@ describe("an Error's message is printed by the one policy wherever it appears", 
       truncated: Object.assign(new RangeError('m'), { code: 'ERR_X', stack: `RangeError [ERR_X]: m?sig=hunter26${frame}` }),
       // A stack of frames alone.
       headless: Object.assign(new Error('m'), { stack: frame.slice(1) }),
+      // A header that is the one V8 wrote for the new message, but the old message went on past it.
+      cut: stale('Request failed\n/api/lookup?token=hunter40', 'Request failed'),
+      // A code in the header that is not node's (upper case): the error's own text.
+      lower: Object.assign(new Error('m'), { code: 'sk_live_hunter41', stack: `Error [sk_live_hunter41]: m${frame}` }),
     };
     const { log, lines, parsed } = logger();
     log.info(errors);
@@ -1595,7 +1599,9 @@ describe("an Error's message is printed by the one policy wherever it appears", 
     const retry = errorHead('retry', 'Error: retry');
     expect(start(line.middle, retry.length)).toBe(retry);
     const rewritten = JSON.stringify({ name: 'Error', message: 'm', stack: `Error: m${frame}` });
-    expect([line.custom, line.not_code, line.tail, line.headless]).toEqual([rewritten, rewritten, rewritten, rewritten]);
+    expect([line.custom, line.not_code, line.tail, line.headless, line.lower]).toEqual(Array(5).fill(rewritten));
+    const failed = errorHead('Request failed', 'Error: Request failed');
+    expect(start(line.cut, failed.length)).toBe(failed);
     expect(line.truncated).toBe(JSON.stringify({ name: 'RangeError', message: 'm', stack: `RangeError: m${frame}` }));
     const symbol = errorHead('m', 'Error: m');
     expect(start(line.symbol, symbol.length)).toBe(symbol);
@@ -1718,7 +1724,7 @@ describe('a form-encoded body (key=value&key=value) has each sensitive value mas
     expect(custom.parsed()[0].body).toBe('usuario=u&contrase%c3%b1a=[REDACTED]');
   });
 
-  it('reads 8 KB of keys that do not decode without an exception per key', () => {
+  it('reads 8 KB of keys that do not decode without decodeURIComponent throwing', () => {
     // decodeURIComponent throws for a bare '%' and for an escape that is not UTF-8. 8 KB is what is left of a value
     // after the 8,192-character cap; Fastify logs a request's URL on every request.
     const original = decodeURIComponent;
@@ -1738,6 +1744,24 @@ describe('a form-encoded body (key=value&key=value) has each sensitive value mas
       decode.mockRestore();
     }
     expect(throws).toBe(0);
+  });
+
+  it('reads 8 KB of keys that do not decode at about the cost of a plain 8 KB word', () => {
+    // Decoding each key with decodeURI or decodeURIComponent in a try, or with URLSearchParams, costs over 10 times as
+    // much here. The costs are compared with each other, the fastest of five runs each, never with a clock bound.
+    const cost = (value: string): number => {
+      const { log, lines } = logger();
+      let fastest = Infinity;
+      for (let run = 0; run < 5; run += 1) {
+        const started = performance.now();
+        for (let call = 0; call < 20; call += 1) log.info({ body: `${value}${call}` });
+        fastest = Math.min(fastest, performance.now() - started);
+      }
+      expect(lines).toHaveLength(100);
+      return fastest;
+    };
+    const plain = cost('a'.repeat(8_000));
+    expect(Math.max(cost('%=&'.repeat(2_666)), cost('%E0=1&'.repeat(1_333))) / plain).toBeLessThan(4);
   });
 
   it('masks a real axios URLSearchParams body in config.data, logged as the axios README logs error.config', async () => {
