@@ -178,8 +178,9 @@ in the middle of a sentence (`see /docs?page=2`), or query parameters held
 without a `?` (`{ query: 'sig=...' }`, axios `config.params`) whose names are
 not sensitive (`sig`), are left as written.
 
-A child logger given an empty or unknown level keeps its parent's level, as
-pino's does: Fastify 5 passes `{ level: '' }` for every request.
+A child logger given an empty or unknown level, or one that is not a string,
+keeps its parent's level, as pino's does for the first two: Fastify 5 passes
+`{ level: '' }` for every request.
 
 **Console bridge.** `installConsoleBridge(logger)` turns `console.*` into
 `app.console` lines, redacted as above: a leading `[TAG]` (e.g.

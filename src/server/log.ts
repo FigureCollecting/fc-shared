@@ -115,7 +115,7 @@ export interface Logger {
   error(...args: unknown[]): void;
   fatal(...args: unknown[]): void;
   silent(...args: unknown[]): void;
-  /** An empty or unknown level keeps this logger's level, as pino's does (Fastify 5 passes level ''). */
+  /** An empty, unknown or non-string level keeps this logger's level, as pino's does for the first two (Fastify 5 passes level ''). */
   child(bindings: Record<string, unknown>, options?: { level?: LevelSetting }): Logger;
   isLevelEnabled(level: string): boolean;
 }
@@ -136,9 +136,9 @@ export function resolveServiceIdentity(env: Env = process.env, overrides: Partia
   };
 }
 
-function parseLevel(value: string | undefined): LevelSetting | undefined {
-  const normalised = value?.trim().toLowerCase();
-  // An own key only: 'constructor' or 'toString' is not a level.
+function parseLevel(value: unknown): LevelSetting | undefined {
+  // A string only (an untyped caller may pass pino's numbers); an own key only: 'constructor' or 'toString' is not a level.
+  const normalised = typeof value === 'string' ? value.trim().toLowerCase() : undefined;
   return normalised !== undefined && Object.hasOwn(SEVERITY, normalised) ? (normalised as LevelSetting) : undefined;
 }
 
