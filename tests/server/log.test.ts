@@ -2110,14 +2110,23 @@ describe('printing a value never throws and stays bounded', () => {
   });
 
   it('strips request targets in linear time: a run of "GET:" never rescans the text after it', () => {
-    // 400 different 8,000-character message parts (under the 8,192 cap): about 2 s when each GET: rescans the rest
-    // of its part (quadratic), tens of ms in linear time. The bound leaves a wide margin both ways.
-    const parts = Array.from({ length: 400 }, (_, index) => `${'GET:'.repeat(2000)}${index}`);
-    const { log, parsed } = logger();
-    const started = performance.now();
-    log.info(...parts);
-    expect(performance.now() - started).toBeLessThan(500);
-    expect((parsed()[0].msg as string).startsWith('GET:GET:')).toBe(true);
+    // Parts 8 times as long (8,000 characters, under the 8,192 cap) cost about 8 times as much in linear time, and
+    // about 64 times when each GET: rescans the rest of its part (quadratic). The two costs are compared with each
+    // other, the fastest of five runs each, never with a clock bound.
+    const cost = (length: number): number => {
+      const parts = Array.from({ length: 50 }, (_, index) => `${'GET:'.repeat(length / 4)}${index}`);
+      const { log, parsed } = logger();
+      let fastest = Infinity;
+      for (let run = 0; run < 5; run += 1) {
+        const started = performance.now();
+        log.info(...parts);
+        fastest = Math.min(fastest, performance.now() - started);
+      }
+      expect((parsed()[0].msg as string).startsWith('GET:GET:')).toBe(true);
+      return fastest;
+    };
+    const short = cost(1_000);
+    expect(cost(8_000) / short).toBeLessThan(24);
   });
 
   it('never reads an object past the fourth level', () => {
