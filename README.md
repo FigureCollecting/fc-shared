@@ -117,43 +117,61 @@ and `runJob`'s final flush do wait, at most `exportTimeoutMillis` (default
 10 s) when the collector accepts connections and never answers.
 
 **Log redaction.** Every value the logger prints (`msg` and its parts,
-`err.message`, each extra field and object key, the reserved `call`, `code`,
-`peer`, `job` and `event`, and every bridged or printf console argument) goes
-through one policy, with the logger's own options. `call` is also cut at its
-first `?` or `#`.
+`err.type` and `err.message`, each extra field and object key, the reserved
+`call`, `code`, `peer`, `job` and `event`, and every bridged or printf console
+argument) goes through one policy, with the logger's own options. An Error's
+message is printed by it wherever it appears: as `err.message`, in `msg`
+(`console.error(err)`, `log.info('failed', err)`) and in its stack. A key that
+names a secret (`password`, `token`, `cookie` ...) has its value masked, also
+when printing changes the key (`/login?token` prints as `/login`). `call` is
+also cut at its first `?` or `#`.
 
-- a `scheme://` URL anywhere in the text loses its userinfo, and its query and
-  fragment up to the next whitespace (a quote does not end it; a closing
-  quote, bracket or punctuation after the query is kept); a request target
-  after an HTTP method (`GET /items?sig=...`) loses its query the same way;
+- a `scheme://` or `//` URL anywhere in the text loses its userinfo, and its
+  query and fragment up to the next whitespace (a quote does not end it; a
+  closing quote, bracket or punctuation after the query is kept); a request
+  target after an HTTP method (`GET /items?sig=...`, Fastify's
+  `GET:/items?sig=...`) loses its query the same way;
 - a value whose first token reads as a URL or path, with or without a scheme
   (`/login?token=...`, `api/v1/items?sig=...`, `cdn.example?sig=...`,
-  `localhost:3000/a?sig=...`, `mailto:a@b?subject=...`), is cut at its first
-  `?` or `#`, whatever follows; a bare query of `key=value` pairs prints
-  empty;
+  `localhost:3000/a?sig=...`, `mailto:a@b?subject=...`), or is followed by a
+  query of `key=value` pairs (`scraper?token=...`, `[::1]:8080?sig=...`), is
+  cut at its first `?` or `#`, whatever follows; so a bare query of
+  `key=value` pairs prints empty;
 - a value under a URL-named key (`url`, `uri`, `href`, `link`, `path`,
   `target`, `endpoint`, `location`, `referer`, `redirect`, their plurals, and
   keys made of them such as `imageUrl` or `redirect_uri`), at any depth and
   through arrays and objects under it, is cut at its first `?` or `#`;
 - a header line (`Cookie: ...` at the start of a line) and a raw header list
   (`rawHeaders`: name, value, ...) have each sensitive header's value masked;
+- a value that is wholly a form-encoded list (`key=value&key=value`, no
+  whitespace, as axios sends a `URLSearchParams` body) has the value of each
+  sensitive key (read decoded, so `api%5Fkey` is `api_key`) masked;
 - a string that is, as a whole, a JSON object or array is key-redacted and
   made compact (JSON inside such a string too, up to four levels);
 - an object is key-redacted in its JSON form (`toJSON` honoured): an Error
   prints as `{name, message, stack}` whatever its `toJSON`, never its own
-  properties; binary data as `[binary]`; a node HTTP message as a summary
-  (an incoming request `{method, url}`, an outgoing request `{method, host,
-  path}`, a response `{statusCode}`) and any other stream (a socket) as
-  `[ClassName]`, never its raw headers; an object that hides itself from
+  properties, the stack's header printed with the message (a header that no
+  longer matches the message becomes `name: message`); binary data as
+  `[binary]`; a node HTTP message, or a wrapper holding one in `raw`
+  (Fastify's Request and Reply), as a summary (an incoming request `{method,
+  url}`, an outgoing request `{method, host, path}`, a response
+  `{statusCode}`) and any other stream (a socket) as `[ClassName]`, never its
+  raw headers or parsed query; an object that hides itself from
   `util.inspect` (fetch `Headers`, a class with `util.inspect.custom` and no
   `toJSON`) as `[ClassName]`; four levels, 100 entries per array or object and
-  1000 entries in all at most;
+  1000 entries in all at most, JSON strings inside the value counted in the
+  same 1000 (a string the value holds many times is read once);
 - a value that cannot be read (a throwing getter, a revoked Proxy) prints as
   `[unserializable]`; a log call never throws for what it was given.
 
 Other free text is masked only by the secret-shape patterns (Bearer, JWT,
-...): a secret in prose, JSON embedded in a longer sentence, or a path in the
-middle of a sentence (`see /docs?page=2`) is left as written.
+...): a secret in prose, JSON or a form embedded in a longer sentence, a path
+in the middle of a sentence (`see /docs?page=2`), or query parameters held
+without a `?` (`{ query: 'sig=...' }`, axios `config.params`) whose names are
+not sensitive (`sig`), are left as written.
+
+A child logger given an empty or unknown level keeps its parent's level, as
+pino's does: Fastify 5 passes `{ level: '' }` for every request.
 
 **Console bridge.** `installConsoleBridge(logger)` turns `console.*` into
 `app.console` lines, redacted as above: a leading `[TAG]` (e.g.
