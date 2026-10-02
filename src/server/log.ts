@@ -401,15 +401,24 @@ function redactText(text: string, redact: RedactOptions, nesting = 0, inUrl = fa
 
 /** A stack frame line, as V8 writes one ('    at fn (file.js:1:2)'). */
 const STACK_FRAME = /^\s+at /;
+/** A node error code, as node writes one in its own errors' stack header ('RangeError [ERR_OUT_OF_RANGE]: ...'). */
+const NODE_ERROR_CODE = /^[A-Z][A-Z0-9_]*$/;
+
+/** The header V8 writes for a name and a message: 'name: message', the name alone for no message, the message alone for no name. */
+function stackHeader(name: string, message: string): string {
+  if (name === '') return message;
+  return message === '' ? name : `${name}: ${message}`;
+}
 
 /**
  * An Error as the logger prints it: {name, message, stack}, never its own
- * properties. The stack's header repeats the message, so that copy is printed
- * as the message is: a header ending in ': ' and the message (V8's 'Error:
- * ...', node's 'RangeError [ERR_X]: ...') keeps what comes before it; any
- * other header (the message changed after the stack was written, a custom
- * stack, a message that is not a string) becomes `name: message`. The frames
- * are kept.
+ * properties. The stack's header repeats the message, so it is written again
+ * from the name and the printed message, as V8 writes it ('name: message'),
+ * or as node writes its own errors ('name [CODE]: message') when the stack
+ * starts with that header. The frames are kept: the lines after that header
+ * when they are all frames, so a message's own frame-shaped lines are printed
+ * as the message; otherwise (the message changed after the stack was written,
+ * a custom stack) the frames after the last line that is not one.
  */
 function errorShape(
   error: Error,
@@ -420,19 +429,25 @@ function errorShape(
 ): { name: string; message: unknown; stack: unknown } {
   const { name, message, stack } = error;
   if (typeof stack !== 'string') return { name, message, stack };
+  const text = typeof message === 'string' ? message : '';
+  const printed = redactText(text, redact, nesting, inUrl, budget);
+  const label = name === undefined ? 'Error' : String(name);
+  const code = (error as { code?: unknown }).code;
+  const coded = typeof code === 'string' && NODE_ERROR_CODE.test(code) ? `${label} [${code}]` : label;
   const lines = stack.split('\n');
   let frames = lines.length;
   while (frames > 0 && STACK_FRAME.test(lines[frames - 1])) frames -= 1;
-  const header = lines.slice(0, frames).join('\n');
-  const text = typeof message === 'string' ? message : '';
-  const printed = redactText(text, redact, nesting, inUrl, budget);
-  const head =
-    text !== '' && header.endsWith(`: ${text}`)
-      ? `${header.slice(0, header.length - text.length)}${printed}`
-      : printed === ''
-        ? name
-        : `${name}: ${printed}`;
-  return { name, message, stack: [head, ...lines.slice(frames)].join('\n') };
+  let prefix = label;
+  let start = frames;
+  for (const candidate of [label, coded]) {
+    const header = stackHeader(candidate, text);
+    const size = header.split('\n').length;
+    if (size >= frames && `${stack}\n`.startsWith(`${header}\n`)) {
+      prefix = candidate;
+      start = size;
+    }
+  }
+  return { name, message, stack: [stackHeader(prefix, printed), ...lines.slice(start)].join('\n') };
 }
 
 function isBinary(value: unknown): boolean {
@@ -549,8 +564,12 @@ function shapeValues(
     if (typeof value === 'bigint') return `${value.toString()}n`;
     if (typeof value === 'function' || typeof value === 'symbol') return `[${typeof value}]`;
     const original = holder[key];
-    // The message key of the shape is printed with the root's URL setting, so its stack copy is too.
-    if (original instanceof Error) return errorShape(original, redact, nesting, rootInUrl, budget);
+    if (original instanceof Error) {
+      // Under a URL-named key the shape's message, stack and name are URL values, as its stack copy of the message is.
+      const shaped = errorShape(original, redact, nesting, urlValued, budget);
+      if (urlValued) inUrl.add(shaped);
+      return shaped;
+    }
     if (isBinary(original)) return '[binary]';
     const stream = streamOf(original);
     if (stream !== undefined) return streamSummary(stream);

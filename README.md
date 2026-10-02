@@ -152,8 +152,14 @@ also cut at its first `?` or `#`.
   made compact (JSON inside such a string too, up to four levels);
 - an object is key-redacted in its JSON form (`toJSON` honoured): an Error
   prints as `{name, message, stack}` whatever its `toJSON`, never its own
-  properties, the stack's header printed with the message (a header that no
-  longer matches the message becomes `name: message`); binary data as
+  properties. Its stack's header is written again from the name and the
+  printed message (`name: message`, or node's `name [CODE]: message` when the
+  stack starts with it). When the stack starts with the header V8 or node
+  wrote for this name and message and only frames follow, those frames are
+  kept; otherwise only the frame lines that end the stack are, so a
+  frame-shaped line (`    at ...`) left from an earlier message can remain.
+  Under a URL-named key, at any depth, its message and stack are URL values;
+  binary data as
   `[binary]`; a node HTTP message, or a wrapper holding one in `raw`
   (Fastify's Request and Reply), as a summary (an incoming request `{method,
   url}`, an outgoing request `{method, host, path}`, a response
