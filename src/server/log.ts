@@ -12,10 +12,13 @@
  * (sanitizeLogValue: no newlines, 1000-char cap); objects become one-line JSON.
  *
  * Every value the logger prints (msg and its parts, err.message, each extra
- * field, bridged and printf console arguments) goes through one policy: a URL
- * loses its query, fragment and userinfo; a string that is a whole JSON object
- * or array is key-redacted; objects are key-redacted in their JSON form (see
- * printValue). A reserved key other than call and err is typed, not redacted.
+ * field and object key, the reserved call, code, peer, job and event, bridged
+ * and printf console arguments) goes through one policy: a URL loses its
+ * query, fragment and userinfo; a value under a URL-named key (url, href,
+ * path ...) is cut at its first ? or #; a sensitive header line or header-list
+ * entry is masked; a string that is a whole JSON object or array is
+ * key-redacted; objects are key-redacted in their JSON form, and a node HTTP
+ * message or stream prints as a short summary (see printValue).
  *
  * The surface is pino-compatible (level, trace..fatal, silent, child), so it can
  * be handed to Fastify as `loggerInstance`. It is promoted from fc-coordinator's
@@ -27,6 +30,8 @@
  * installConsoleBridge() turns stray console.* calls into one app.console line
  * each, so a service's legacy console output joins the shape without edits.
  */
+import { ClientRequest, IncomingMessage, ServerResponse } from 'node:http';
+import { Stream } from 'node:stream';
 import { formatWithOptions } from 'node:util';
 import { isSpanContextValid, trace } from '@opentelemetry/api';
 import { sanitizeLogValue } from '../utils/logger';
@@ -37,7 +42,6 @@ import {
   type RedactOptions,
 } from '../utils/sanitize';
 import { roundMs } from './fields';
-import { stripUrl } from './redact';
 
 export const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal'] as const;
 export type LogLevel = (typeof LOG_LEVELS)[number];
@@ -161,6 +165,10 @@ function isSensitive(key: string, redact: RedactOptions): boolean {
   return pattern.test(key);
 }
 
+function placeholder(redact: RedactOptions): string {
+  return redact.placeholder ?? '[REDACTED]';
+}
+
 function safeString(value: string, redact: RedactOptions): string {
   return sanitizeLogValue(redactText(value, redact));
 }
@@ -168,18 +176,17 @@ function safeString(value: string, redact: RedactOptions): string {
 /** Flatten one extra field to a scalar the schema accepts. */
 function flatValue(key: string, value: unknown, redact: RedactOptions): Scalar {
   if (value === null) return null;
-  if (isSensitive(key, redact)) return redact.placeholder ?? '[REDACTED]';
+  if (isSensitive(key, redact)) return placeholder(redact);
   switch (typeof value) {
     case 'string':
-      return safeString(value, redact);
+    case 'object':
+      return sanitizeLogValue(printValue(value, redact, 0, isUrlKey(key)));
     case 'number':
       return Number.isFinite(value) ? value : String(value);
     case 'boolean':
       return value;
     case 'bigint':
       return `${value.toString()}n`;
-    case 'object':
-      return sanitizeLogValue(printValue(value, redact));
     default:
       return `[${typeof value}]`;
   }
@@ -190,27 +197,85 @@ const INSPECT_CUSTOM = Symbol.for('nodejs.util.inspect.custom');
 /** Entries kept per array or object; past it, MAX_ENTRIES - 1 and a count of the rest. */
 const MAX_ENTRIES = 100;
 const TRUNCATED = '[truncated:max-depth]';
+/**
+ * Entries read per printed value, all levels together; past it, an object or
+ * array prints a marker, unread. A printed value is cut at 1000 characters and
+ * every entry prints at least two, so the marker never shows in what is kept;
+ * it bounds the work for a graph that shares references (width ^ depth).
+ */
+const MAX_TOTAL_ENTRIES = 1000;
+const TRUNCATED_ENTRIES = '[truncated:max-entries]';
 /** What a value (or a whole call) the logger cannot read prints as. */
 const UNSERIALIZABLE = '[unserializable]';
 
 /**
  * A URL anywhere in text: a scheme (at most 32 characters, so a long word
  * costs linear time), optional userinfo (up to the last '@' before the path),
- * host and path, then a query or fragment that runs to the next space or quote.
+ * host and path, then a query or fragment that runs to the next whitespace. A
+ * quote does not end the query: encodeURIComponent leaves an apostrophe raw.
  */
-const URL_IN_TEXT = /([a-z][a-z0-9+.-]{0,31}:\/\/)(?:[^\s/?#"'<>`]*@)?([^\s?#"'<>`]*)(?:[?#][^\s"'<>`]*)?/gi;
-/** A whole value that is a path (or //host/path) carrying a query or fragment. */
-const PATH_WITH_QUERY = /^\/\S*[?#]/;
+const URL_IN_TEXT = /([a-z][a-z0-9+.-]{0,31}:\/\/)(?:[^\s/?#]*@)?([^\s?#]*)([?#]\S*)?/gi;
+/** An HTTP method and a request target carrying a query or fragment ('GET /items?sig=1 HTTP/1.1'). */
+const REQUEST_TARGET = /\b(GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH)( +[^\s?#]*)([?#]\S*)/g;
+/** What a stripped query keeps of its end: the quote, bracket or punctuation that closes the URL. */
+const CLOSERS = '\'"`)]}>.,;:!';
+/** A value's first token up to a ? or # (no whitespace before it). */
+const LEADING_TOKEN = /^([^\s?#]*)[?#]/;
+/** A token that reads as a URL or a path: a scheme, any slash or backslash, or a dotted host and port. */
+const URL_SHAPED = /^[a-z][a-z0-9+.-]{0,31}:|[\\/]|^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?$/i;
+/** A value that is a bare query or fragment of key=value pairs ('?token=1', '#access_token=1'). */
+const BARE_QUERY = /^[?#][^\s=]*=/;
+/** A header line, at the start of the text or of a line: `Name: value`. */
+const HEADER_LINE = /(^|[\r\n])([!#$%&'*+.^_`|~0-9A-Za-z-]+)([ \t]*:[ \t]*)[^\r\n]*/g;
+/** A header name (an RFC 9110 token). */
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+/** Words that, as one part of a key (imageUrl, redirect_uri, links), mark its value as a URL. */
+const URL_KEY_WORDS = new Set([
+  'url', 'urls', 'uri', 'uris', 'href', 'hrefs', 'link', 'links', 'path', 'paths', 'target', 'endpoint',
+  'endpoints', 'location', 'referer', 'referrer', 'redirect', 'redirects',
+]);
+
+function isUrlKey(key: string): boolean {
+  return toSnakeCase(key).split('_').some((word) => URL_KEY_WORDS.has(word));
+}
+
+/** The closing characters that end a query: they belong to the text around the URL. A query starts with ? or #, never one. */
+function closers(query: string): string {
+  let start = query.length;
+  while (CLOSERS.includes(query[start - 1])) start -= 1;
+  return query.slice(start);
+}
+
+function stripQuery(_match: string, before: string, kept: string, query: string | undefined): string {
+  return before + kept + (query === undefined ? '' : closers(query));
+}
 
 /**
- * Text with the query, fragment and userinfo of every `scheme://` URL in it
- * removed, and a whole path value cut at its query (lg-logging plan-v2: the
- * logger strips query strings). The rest of the text is kept as written.
+ * Text without the query, fragment and userinfo of any URL in it (lg-logging
+ * plan-v2: the logger strips query strings). A value whose first token reads
+ * as a URL or path (with or without a scheme) is cut at its first ? or #,
+ * whatever follows; a bare query of key=value pairs prints empty; a request
+ * target after an HTTP method and every `scheme://` URL lose their query up to
+ * the next whitespace. The rest of the text is kept as written.
  */
 function stripUrls(text: string): string {
   const trimmed = text.trim();
-  if (PATH_WITH_QUERY.test(trimmed)) return stripUrl(trimmed);
-  return text.replace(URL_IN_TEXT, '$1$2');
+  if (BARE_QUERY.test(trimmed)) return '';
+  const leading = LEADING_TOKEN.exec(trimmed);
+  const kept = leading !== null && URL_SHAPED.test(leading[1]) ? leading[1] : text;
+  return kept.replace(REQUEST_TARGET, stripQuery).replace(URL_IN_TEXT, stripQuery);
+}
+
+/** Text with the value of each sensitive header line (`Cookie: ...`, `Authorization: Basic ...`) masked. */
+function maskHeaderLines(text: string, redact: RedactOptions): string {
+  return text.replace(HEADER_LINE, (line: string, start: string, name: string, colon: string) =>
+    isSensitive(name, redact) ? `${start}${name}${colon}${placeholder(redact)}` : line,
+  );
+}
+
+/** Text that is not a JSON document as the logger prints it; also every object key. */
+function plainText(text: string, redact: RedactOptions): string {
+  return stripUrls(maskHeaderLines(redactString(text, redact), redact));
 }
 
 /** The parsed value of a string that is, as a whole, a JSON object or array. */
@@ -227,13 +292,16 @@ function jsonDocument(text: string): object | undefined {
 /**
  * A string as the logger prints it. A whole JSON object or array is printed as
  * an object is and re-emitted compact, up to four strings deep (a fifth prints
- * the depth marker, never its text). Any other text has the secret-shape
- * patterns masked and its URLs stripped.
+ * the depth marker, never its text). Any other text goes through plainText,
+ * then, as a URL value (inUrl), is cut at its first ? or #.
  */
-function redactText(text: string, redact: RedactOptions, nesting = 0): string {
+function redactText(text: string, redact: RedactOptions, nesting = 0, inUrl = false): string {
   const doc = jsonDocument(text);
-  if (doc === undefined) return stripUrls(redactString(text, redact));
-  return nesting < MAX_FIELD_DEPTH ? JSON.stringify(printValue(doc, redact, nesting + 1)) : TRUNCATED;
+  if (doc !== undefined) {
+    return nesting < MAX_FIELD_DEPTH ? JSON.stringify(printValue(doc, redact, nesting + 1, inUrl)) : TRUNCATED;
+  }
+  const plain = plainText(text, redact);
+  return inUrl ? plain.split(/[?#]/)[0].trim() : plain;
 }
 
 function isBinary(value: unknown): boolean {
@@ -244,6 +312,23 @@ function isBinary(value: unknown): boolean {
 function classLabel(value: object): string {
   const name: unknown = (value as { constructor?: { name?: unknown } }).constructor?.name;
   return `[${typeof name === 'string' && name !== '' ? name : 'object'}]`;
+}
+
+/**
+ * A node stream as the logger prints it, never its internals (a
+ * ClientRequest's _header holds the request line and every header, an
+ * IncomingMessage's rawHeaders every header): an incoming request as {method,
+ * url}, an incoming response as {statusCode}, an outgoing request as {method,
+ * host, path}, a server response as {statusCode}; any other stream (a socket,
+ * follow-redirects' request) as [ClassName]. url and path are URL values.
+ */
+function streamSummary(stream: Stream): unknown {
+  if (stream instanceof IncomingMessage) {
+    return stream.method ? { method: stream.method, url: stream.url } : { statusCode: stream.statusCode };
+  }
+  if (stream instanceof ClientRequest) return { method: stream.method, host: stream.host, path: stream.path };
+  if (stream instanceof ServerResponse) return { statusCode: stream.statusCode };
+  return classLabel(stream);
 }
 
 /** The array or object itself, or past MAX_ENTRIES its first MAX_ENTRIES - 1 entries and a count of the rest. */
@@ -261,29 +346,68 @@ function bounded(value: object): object {
 }
 
 /**
+ * A raw header list (node's rawHeaders: name, value, name, value ...) with the
+ * value after each sensitive name masked. An array of odd length, or with an
+ * even entry that is not a header name, is not a header list and is returned.
+ */
+function headerList(list: unknown[], redact: RedactOptions): unknown[] {
+  const names = list.length % 2 === 0 && list.every((item, index) => index % 2 === 1 || HEADER_NAME.test(String(item)));
+  if (!names) return list;
+  return list.map((item, index) =>
+    index % 2 === 1 && isSensitive(String(list[index - 1]), redact) ? placeholder(redact) : item,
+  );
+}
+
+/** The object with its keys printed as text is (a URL key loses its query); the object itself when no key changes. */
+function rekeyed(value: object, redact: RedactOptions): object {
+  const keys = Object.keys(value);
+  const printed = keys.map((key) => plainText(key, redact));
+  if (printed.every((key, index) => key === keys[index])) return value;
+  const out: Record<string, unknown> = {};
+  keys.forEach((key, index) => {
+    out[printed[index]] = (value as Record<string, unknown>)[key];
+  });
+  return out;
+}
+
+/**
  * The JSON.stringify replacer behind printValue. JSON.stringify has already
  * applied toJSON (so AxiosHeaders, a URL or a Date arrive as their JSON form);
  * the original is read back from the holder.
- *   - a string: redactText; a bigint: '10n'; a function or symbol: '[function]';
+ *   - a string: redactText, as a URL value when its key, or a key above it, is
+ *     URL-named (url, href, links ...); a bigint: '10n'; a function or
+ *     symbol: '[function]';
  *   - an Error: {name, message, stack}, never its own properties (an
  *     AxiosError's config and response), whatever its toJSON says;
  *   - binary (Buffer, TypedArray, ArrayBuffer): '[binary]';
+ *   - a node stream (an HTTP request or response, a socket): streamSummary;
  *   - an object that hides itself, i.e. its toJSON gave nothing or it defines
  *     util.inspect.custom with no toJSON (fetch Headers, a credential class):
  *     '[ClassName]';
  *   - a cycle: '[circular]'; an object four levels down: the depth marker,
- *     unread; an array or object: at most MAX_ENTRIES entries.
+ *     unread; an array or object: at most MAX_ENTRIES entries, a header list
+ *     masked (headerList), object keys printed as text (rekeyed); past
+ *     MAX_TOTAL_ENTRIES entries in all, the entries marker, unread.
  */
-function shapeValues(redact: RedactOptions, nesting: number): (this: unknown, key: string, value: unknown) => unknown {
+function shapeValues(
+  redact: RedactOptions,
+  nesting: number,
+  rootInUrl: boolean,
+): (this: unknown, key: string, value: unknown) => unknown {
   const parents = new WeakMap<object, object>();
+  const inUrl = new WeakSet<object>();
+  let left = MAX_TOTAL_ENTRIES;
   return function shape(this: unknown, key: string, value: unknown): unknown {
-    if (typeof value === 'string') return redactText(value, redact, nesting);
+    const holder = this as Record<string, unknown>;
+    // Under a URL-named key every value is a URL value, so a URL root makes them all one.
+    const urlValued = rootInUrl || isUrlKey(key) || inUrl.has(holder);
+    if (typeof value === 'string') return redactText(value, redact, nesting, urlValued);
     if (typeof value === 'bigint') return `${value.toString()}n`;
     if (typeof value === 'function' || typeof value === 'symbol') return `[${typeof value}]`;
-    const holder = this as Record<string, unknown>;
     const original = holder[key];
     if (original instanceof Error) return { name: original.name, message: original.message, stack: original.stack };
     if (isBinary(original)) return '[binary]';
+    if (original instanceof Stream) return streamSummary(original);
     // toJSON gave nothing (value undefined, original an object): it chose not to be shown.
     if (value === undefined && original !== undefined) return classLabel(original as object);
     if (typeof value !== 'object' || value === null) return value;
@@ -294,35 +418,48 @@ function shapeValues(redact: RedactOptions, nesting: number): (this: unknown, ke
       depth += 1;
     }
     if (depth > MAX_FIELD_DEPTH) return TRUNCATED;
-    const kept = bounded(value);
+    const kept = Array.isArray(value) ? bounded(headerList(value, redact)) : rekeyed(bounded(value), redact);
+    left -= Object.keys(kept).length;
+    if (left < 0) return TRUNCATED_ENTRIES;
     parents.set(kept, holder);
+    if (urlValued) inUrl.add(kept);
     return kept;
   };
 }
 
 /**
  * Any value as the logger prints it, the one policy behind every extra field,
- * message part, err and bridged or printf argument. A string goes
- * through redactText. An object is taken in its JSON form, shaped by
+ * message part, err, reserved value and bridged or printf argument. A string
+ * goes through redactText. An object is taken in its JSON form, shaped by
  * shapeValues, then key-redacted with the logger's options (cookie,
  * authorization, password ...); a value that cannot be read (a throwing
  * getter or toJSON, a revoked Proxy) prints as '[unserializable]'. null
- * stays null; other primitives are returned unchanged.
+ * stays null; other primitives are returned unchanged. inUrl: the value sits
+ * under a URL-named key, so every string in it is a URL value.
  */
-function printValue(value: unknown, redact: RedactOptions, nesting = 0): unknown {
-  if (typeof value === 'string') return redactText(value, redact, nesting);
+function printValue(value: unknown, redact: RedactOptions, nesting = 0, inUrl = false): unknown {
+  if (typeof value === 'string') return redactText(value, redact, nesting, inUrl);
   if (typeof value !== 'object') return value;
   try {
-    return redactValue(JSON.parse(JSON.stringify(value, shapeValues(redact, nesting))) as unknown, redact);
+    return redactValue(JSON.parse(JSON.stringify(value, shapeValues(redact, nesting, inUrl))) as unknown, redact);
   } catch {
     return UNSERIALIZABLE;
   }
 }
 
-/** The log shape's `err`: {type, message}, the message printed as any other text is. */
+/** A reserved value (call, code, peer, job, event) as one string, printed as any value is. */
+function reservedText(value: unknown, redact: RedactOptions): string {
+  return sanitizeLogValue(printValue(value, redact));
+}
+
+/** The log shape's `err`: {type, message}, the message printed as any other text is; an Error it cannot read says so. */
 function errField(value: unknown, redact: RedactOptions): { type: string; message: string } {
-  if (value instanceof Error) return { type: value.name, message: safeString(value.message, redact) };
-  return { type: typeof value, message: sanitizeLogValue(printValue(value, redact)) };
+  if (!(value instanceof Error)) return { type: typeof value, message: reservedText(value, redact) };
+  try {
+    return { type: value.name, message: safeString(value.message, redact) };
+  } catch {
+    return { type: 'Error', message: UNSERIALIZABLE };
+  }
 }
 
 function nonNegativeMs(value: unknown): number | undefined {
@@ -344,7 +481,7 @@ function buildEntry(
   const extras: Record<string, Scalar> = {};
   for (const [rawKey, value] of Object.entries(merged)) {
     if (value === undefined) continue;
-    const key = toSnakeCase(rawKey);
+    const key = toSnakeCase(plainText(rawKey, core.redact));
     if (OWNED.has(key)) continue;
     if (CALLER_RESERVED.has(key)) reserved[key] = value;
     else extras[key] = flatValue(key, value, core.redact);
@@ -355,21 +492,21 @@ function buildEntry(
     level,
     service: core.identity.service,
     version: core.identity.version,
-    event: typeof reserved['event'] === 'string' ? sanitizeLogValue(reserved['event']) : 'app.log',
+    event: typeof reserved['event'] === 'string' ? reservedText(reserved['event'], core.redact) : 'app.log',
     msg: safeString(message, core.redact),
   };
 
-  const call = reserved['call'] === undefined ? '' : sanitizeLogValue(reserved['call']).split(/[?#]/)[0].trim();
+  const call = reserved['call'] === undefined ? '' : reservedText(reserved['call'], core.redact).split(/[?#]/)[0].trim();
   if (call !== '') entry['call'] = call;
   if (typeof reserved['code'] === 'string' || typeof reserved['code'] === 'number') {
-    entry['code'] = sanitizeLogValue(String(reserved['code']));
+    entry['code'] = reservedText(String(reserved['code']), core.redact);
   }
   const duration = nonNegativeMs(reserved['duration_ms']);
   if (duration !== undefined) entry['duration_ms'] = duration;
-  if (reserved['peer'] !== undefined) entry['peer'] = sanitizeLogValue(reserved['peer']);
+  if (reserved['peer'] !== undefined) entry['peer'] = reservedText(reserved['peer'], core.redact);
   const ids = activeIds();
   if (ids !== undefined) Object.assign(entry, ids);
-  const job = reserved['job'] === undefined ? core.job : sanitizeLogValue(reserved['job']);
+  const job = reserved['job'] === undefined ? core.job : reservedText(reserved['job'], core.redact);
   if (job !== undefined) entry['job'] = job;
   if (reserved['err'] !== undefined) entry['err'] = errField(reserved['err'], core.redact);
   const queued = nonNegativeMs(reserved['queue_ms']);
@@ -400,14 +537,14 @@ function stringifyArg(arg: unknown, redact: RedactOptions): string {
   return sanitizeLogValue(arg instanceof Error ? arg : printValue(arg, redact));
 }
 
-/** pino call shapes: (msg...), (obj, msg...), (err, msg...). */
+/** pino call shapes: (msg...), (obj, msg...), (err, msg...); a stream (an HTTP request) first is a message part. */
 function splitArgs(args: unknown[], redact: RedactOptions): { fields: Record<string, unknown>; message: string } {
   const [first, ...rest] = args;
   const text = (parts: unknown[]): string => parts.map((part) => stringifyArg(part, redact)).join(' ');
   if (first instanceof Error) {
     return { fields: { err: first }, message: rest.length > 0 ? text(rest) : first.message };
   }
-  if (first !== null && typeof first === 'object' && !Array.isArray(first)) {
+  if (first !== null && typeof first === 'object' && !Array.isArray(first) && !(first instanceof Stream)) {
     return { fields: first as Record<string, unknown>, message: text(rest) };
   }
   return { fields: {}, message: text(args) };
@@ -525,7 +662,8 @@ function bridgeArgs(args: unknown[], redact: RedactOptions): [Record<string, unk
   try {
     let text = consoleText(args, redact).replace(LEADING_TIMESTAMP, '');
     const fields: Record<string, unknown> = { event: 'app.console' };
-    const tag = LEADING_TAG.exec(text);
+    // Only the caller's own first string writes a tag, never a printed value ('[Socket]', '[unserializable]').
+    const tag = typeof args[0] === 'string' && args[0].startsWith('[') ? LEADING_TAG.exec(text) : null;
     if (tag !== null) {
       fields['tag'] = tag[1].trim();
       text = text.slice(tag[0].length);
@@ -541,7 +679,8 @@ function bridgeArgs(args: unknown[], redact: RedactOptions): [Record<string, unk
 /**
  * Route console.log/info/warn/error/debug through `logger` as one app.console
  * line each (log -> info). A leading `[TAG]` (spaces allowed, e.g. `[BROWSER
- * POOL]`) becomes the `tag` field, after dropping a leading `[ISO timestamp]`;
+ * POOL]`) that the first argument, a string, starts with becomes the `tag`
+ * field, after dropping a leading `[ISO timestamp]`;
  * an Error argument becomes `err`. Every argument, printf arguments included,
  * is printed as a logger field value is, with the logger's own options: a
  * string that is a whole JSON object or array is key-redacted and made

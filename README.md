@@ -117,31 +117,48 @@ and `runJob`'s final flush do wait, at most `exportTimeoutMillis` (default
 10 s) when the collector accepts connections and never answers.
 
 **Log redaction.** Every value the logger prints (`msg` and its parts,
-`err.message`, each extra field, and every bridged or printf console argument)
-goes through one policy, with the logger's own options. The reserved keys
-other than `call` (cut at its query) and `err` are typed, not redacted.
+`err.message`, each extra field and object key, the reserved `call`, `code`,
+`peer`, `job` and `event`, and every bridged or printf console argument) goes
+through one policy, with the logger's own options. `call` is also cut at its
+first `?` or `#`.
 
 - a `scheme://` URL anywhere in the text loses its userinfo, and its query and
-  fragment up to the next space or quote; a value that is a whole path
-  (`/login?token=...`) is cut at its query; other text is kept as written;
+  fragment up to the next whitespace (a quote does not end it; a closing
+  quote, bracket or punctuation after the query is kept); a request target
+  after an HTTP method (`GET /items?sig=...`) loses its query the same way;
+- a value whose first token reads as a URL or path, with or without a scheme
+  (`/login?token=...`, `api/v1/items?sig=...`, `cdn.example?sig=...`,
+  `localhost:3000/a?sig=...`, `mailto:a@b?subject=...`), is cut at its first
+  `?` or `#`, whatever follows; a bare query of `key=value` pairs prints
+  empty;
+- a value under a URL-named key (`url`, `uri`, `href`, `link`, `path`,
+  `target`, `endpoint`, `location`, `referer`, `redirect`, their plurals, and
+  keys made of them such as `imageUrl` or `redirect_uri`), at any depth and
+  through arrays and objects under it, is cut at its first `?` or `#`;
+- a header line (`Cookie: ...` at the start of a line) and a raw header list
+  (`rawHeaders`: name, value, ...) have each sensitive header's value masked;
 - a string that is, as a whole, a JSON object or array is key-redacted and
   made compact (JSON inside such a string too, up to four levels);
 - an object is key-redacted in its JSON form (`toJSON` honoured): an Error
   prints as `{name, message, stack}` whatever its `toJSON`, never its own
-  properties; binary data as
-  `[binary]`; an object that hides itself from `util.inspect` (fetch
-  `Headers`, a class with `util.inspect.custom` and no `toJSON`) as
-  `[ClassName]`; four levels and 100 entries per array or object at most;
+  properties; binary data as `[binary]`; a node HTTP message as a summary
+  (an incoming request `{method, url}`, an outgoing request `{method, host,
+  path}`, a response `{statusCode}`) and any other stream (a socket) as
+  `[ClassName]`, never its raw headers; an object that hides itself from
+  `util.inspect` (fetch `Headers`, a class with `util.inspect.custom` and no
+  `toJSON`) as `[ClassName]`; four levels, 100 entries per array or object and
+  1000 entries in all at most;
 - a value that cannot be read (a throwing getter, a revoked Proxy) prints as
   `[unserializable]`; a log call never throws for what it was given.
 
 Other free text is masked only by the secret-shape patterns (Bearer, JWT,
-...): a secret in prose, or JSON embedded in a longer sentence, is not
-key-redacted.
+...): a secret in prose, JSON embedded in a longer sentence, or a path in the
+middle of a sentence (`see /docs?page=2`) is left as written.
 
 **Console bridge.** `installConsoleBridge(logger)` turns `console.*` into
 `app.console` lines, redacted as above: a leading `[TAG]` (e.g.
-`[BROWSER POOL]`) becomes `tag`, and an Error argument becomes `err`.
+`[BROWSER POOL]`) that the first argument, a string, starts with becomes
+`tag`, and an Error argument becomes `err`.
 
 **ESM services** (`"type": "module"`) must preload the OpenTelemetry loader hook,
 or instrumentations (pg, for one) never see modules loaded through `import`:
