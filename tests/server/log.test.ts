@@ -1088,8 +1088,8 @@ describe('URLs in log output lose their query, fragment and userinfo (plan-v2 pr
     const { log, lines, parsed } = logger();
     log.info({
       // Query values with no sensitive word, so the key's own words do not mask the value.
-      statuses: { 'https://cdn.example/a.jpg?X-Amz-Signature=hunter1': 403, plain: 200 },
-      'https://cdn.example/b.jpg?sig=hunter2': 404,
+      statuses: { 'https://cdn.example/a.jpg?X-Amz-Date=hunter1': 403, plain: 200 },
+      'https://cdn.example/b.jpg?v=hunter2': 404,
     });
     const [line] = parsed();
     expect(line.statuses).toBe('{"https://cdn.example/a.jpg":403,"plain":200}');
@@ -1100,9 +1100,13 @@ describe('URLs in log output lose their query, fragment and userinfo (plan-v2 pr
   it('masks the value of a key that names a secret before its query is cut, nested and at the top level', () => {
     const { log, lines, parsed } = logger();
     // 'api key' names a secret only once printed (api_key): that decides too.
-    log.info({ cache: { '/login?password': 'hunter1', '/a?page': 2 }, '/login?token': 'hunter2', 'api key': 'hunter3' });
+    log.info({
+      cache: { '/login?password': 'hunter1', '/a?page': 2, '/s?X-Amz-Signature': 'hunter4' },
+      '/login?token': 'hunter2',
+      'api key': 'hunter3',
+    });
     const [line] = parsed();
-    expect(line.cache).toBe('{"/login":"[REDACTED]","/a":2}');
+    expect(line.cache).toBe('{"/login":"[REDACTED]","/a":2,"/s":"[REDACTED]"}');
     expect(line).toMatchObject({ login: '[REDACTED]', api_key: '[REDACTED]' });
     expect(lines[0]).not.toContain('hunter');
   });
@@ -1467,9 +1471,10 @@ describe("an Error's message is printed by the one policy wherever it appears", 
     const { target, uninstall, msgs } = bridged();
     target.error(Object.assign(new Error('/api/lookup?token=hunter36'), { name: '' }));
     target.error(Object.assign(new Error('m'), { name: undefined }));
+    target.error(Object.assign(new Error('m'), { name: null }));
     target.error(new Error(''));
     uninstall();
-    expect(msgs()).toEqual(['/api/lookup', 'Error: m', 'Error']);
+    expect(msgs()).toEqual(['/api/lookup', 'Error: m', 'null: m', 'Error']);
   });
 
   it('in the stack of an Error printed as an object: a field, nested, and under %s, %o, %O and %j', () => {
@@ -1735,10 +1740,16 @@ describe('a form-encoded body (key=value&key=value) has each sensitive value mas
 
   it("reads a '+' in a key as a space, as a server does, and an escaped '+' as a '+'", () => {
     const { log, lines, parsed } = logger({ redact: { sensitiveKeyPattern: /api key/i } });
-    log.info({ plus: 'api+key=hunter70&x=1', escaped: 'api%20key=hunter71&x=1', literal: 'api%2Bkey=visible&x=1' });
+    log.info({
+      plus: 'api+key=hunter70&x=1',
+      plusses: 'x+api+key=hunter72&x=1',
+      escaped: 'api%20key=hunter71&x=1',
+      literal: 'api%2Bkey=visible&x=1',
+    });
     expect(lines.join('\n')).not.toMatch(/hunter/);
     expect(parsed()[0]).toMatchObject({
       plus: 'api+key=[REDACTED]&x=1',
+      plusses: 'x+api+key=[REDACTED]&x=1',
       escaped: 'api%20key=[REDACTED]&x=1',
       literal: 'api%2Bkey=visible&x=1',
     });
@@ -1811,28 +1822,30 @@ describe('a form-encoded body (key=value&key=value) has each sensitive value mas
 describe('the query and form keys code, code_verifier, sig and signature are sensitive', () => {
   it('in a form-encoded value, as a word of the key, whatever key pattern the service gives', () => {
     const { log, lines, parsed } = logger();
+    // unsigned: keys in which sig or code is only part of a longer word.
     log.info({
       oauth: 'code=hunter50&state=s&code_verifier=hunter51',
       signed: 'X-Amz-Date=1&X-Amz-Signature=hunter52&sig=hunter53&signature=hunter54',
       words: 'urlSig=hunter55&device_code=hunter56&codeVerifier=hunter57&%73ig=hunter58',
-      unsigned: 'signal=1&design=2&sigma=3&barcode=4',
+      unsigned: 'signal=1&design=2&sigma=3&barcode=4&codec=5&nosig=6',
     });
     const custom = logger({ redact: { sensitiveKeyPattern: /dpop/i } });
-    custom.log.info({ query: 'sig=hunter59&page=2&dpop=hunter60' });
+    custom.log.info({ query: 'sig=hunter59&page=2&dpop=hunter60', q: { codeVerifier: 'hunter66' } });
     expect([...lines, ...custom.lines].join('\n')).not.toMatch(/hunter/);
     expect(parsed()[0]).toMatchObject({
       oauth: 'code=[REDACTED]&state=s&code_verifier=[REDACTED]',
       signed: 'X-Amz-Date=1&X-Amz-Signature=[REDACTED]&sig=[REDACTED]&signature=[REDACTED]',
       words: 'urlSig=[REDACTED]&device_code=[REDACTED]&codeVerifier=[REDACTED]&%73ig=[REDACTED]',
-      unsigned: 'signal=1&design=2&sigma=3&barcode=4',
+      unsigned: 'signal=1&design=2&sigma=3&barcode=4&codec=5&nosig=6',
     });
-    expect(custom.parsed()[0].query).toBe('sig=[REDACTED]&page=2&dpop=[REDACTED]');
+    expect(custom.parsed()[0]).toMatchObject({ query: 'sig=[REDACTED]&page=2&dpop=[REDACTED]', q: '{"codeVerifier":"[REDACTED]"}' });
   });
 
   it('sig, signature and code_verifier also as an object key at any depth and a header name; code only in a form', () => {
     const { log, lines, parsed } = logger();
     log.info({
       q: { sig: 'hunter61', page: '2' },
+      deep: { a: { b: [{ urlSig: 'hunter67' }] } },
       params: { 'X-Amz-Signature': 'hunter62', codeVerifier: 'hunter63' },
       signature: 'hunter64',
       headers: 'Signature: sig1=:hunter65:',
@@ -1845,6 +1858,7 @@ describe('the query and form keys code, code_verifier, sig and signature are sen
     const [signed, coded, prose] = parsed();
     expect(signed).toMatchObject({
       q: JSON.stringify({ sig: '[REDACTED]', page: '2' }),
+      deep: JSON.stringify({ a: { b: [{ urlSig: '[REDACTED]' }] } }),
       params: JSON.stringify({ 'X-Amz-Signature': '[REDACTED]', codeVerifier: '[REDACTED]' }),
       signature: '[REDACTED]',
       headers: 'Signature: [REDACTED]',
@@ -2213,9 +2227,9 @@ describe('printing a value never throws and stays bounded', () => {
   });
 
   it('strips request targets in linear time: a run of "GET:" never rescans the text after it', () => {
-    // Parts 8 times as long (8,000 characters, under the 8,192 cap) cost about 8 times as much in linear time, and
-    // about 64 times when each GET: rescans the rest of its part (quadratic). The two costs are compared with each
-    // other, the fastest of five runs each, never with a clock bound.
+    // Parts 16 times as long (8,000 characters, under the 8,192 cap) cost at most 16 times as much in linear time
+    // (9 to 18 measured, all cores busy included), and over 50 times when each GET: rescans the rest of its part
+    // (quadratic). The two costs are compared with each other, the fastest of five runs each, never with a clock bound.
     const cost = (length: number): number => {
       const parts = Array.from({ length: 50 }, (_, index) => `${'GET:'.repeat(length / 4)}${index}`);
       const { log, parsed } = logger();
@@ -2228,8 +2242,8 @@ describe('printing a value never throws and stays bounded', () => {
       expect((parsed()[0].msg as string).startsWith('GET:GET:')).toBe(true);
       return fastest;
     };
-    const short = cost(1_000);
-    expect(cost(8_000) / short).toBeLessThan(24);
+    const short = cost(500);
+    expect(cost(8_000) / short).toBeLessThan(36);
   });
 
   it('never reads an object past the fourth level', () => {

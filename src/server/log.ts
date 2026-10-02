@@ -115,7 +115,10 @@ export interface Logger {
   error(...args: unknown[]): void;
   fatal(...args: unknown[]): void;
   silent(...args: unknown[]): void;
-  /** An empty, unknown or non-string level keeps this logger's level, as pino's does for the first two (Fastify 5 passes level ''). */
+  /**
+   * An empty, unknown or non-string level keeps this logger's level (Fastify 5
+   * passes level ''); pino keeps it for an empty level and throws for an unknown one.
+   */
   child(bindings: Record<string, unknown>, options?: { level?: LevelSetting }): Logger;
   isLevelEnabled(level: string): boolean;
 }
@@ -164,10 +167,25 @@ interface Core {
 
 type Scalar = string | number | boolean | null;
 
-function isSensitive(key: string, redact: RedactOptions): boolean {
+/**
+ * Query and form keys that hold a secret under a plain name: a URL signature
+ * (sig, signature, X-Amz-Signature) and a PKCE code_verifier, each a word of
+ * the snake_case key (urlSig, codeVerifier), whatever key pattern the service
+ * gives.
+ */
+const QUERY_SECRET_KEY = /(?:^|_)(?:sig|signature|code_verifier)(?:_|$)/;
+/** In a form an OAuth code too; as an object key, code is the log shape's own field and an error's code. */
+const FORM_SECRET_KEY = /(?:^|_)code(?:_|$)/;
+/** A key that can hold one of those words: only it is snake-cased (snake-casing every key doubled an 8 KB form's cost). */
+const SECRET_WORD_HINT = /sig|code/i;
+
+function isSensitive(key: string, redact: RedactOptions, form = false): boolean {
   const pattern = redact.sensitiveKeyPattern ?? DEFAULT_SENSITIVE_KEY_PATTERN;
   pattern.lastIndex = 0;
-  return pattern.test(key);
+  if (pattern.test(key)) return true;
+  if (!SECRET_WORD_HINT.test(key)) return false;
+  const snake = toSnakeCase(key);
+  return QUERY_SECRET_KEY.test(snake) || (form && FORM_SECRET_KEY.test(snake));
 }
 
 function placeholder(redact: RedactOptions): string {
@@ -295,20 +313,23 @@ function maskHeaderLines(text: string, redact: RedactOptions): string {
 const ESCAPES = /(?:%[0-9A-Fa-f]{2})+/g;
 
 /**
- * A form key as a server reads it: each run of %XX escapes decoded as UTF-8,
- * a byte that is not UTF-8 read as U+FFFD, a '%' that starts no escape kept.
- * Never an exception, so a key that does not decode costs what one that does
- * costs (decodeURIComponent throws for each).
+ * A form key as a server reads it (WHATWG form decoding): each '+' read as a
+ * space, then each run of %XX escapes decoded as UTF-8, a byte that is not
+ * UTF-8 read as U+FFFD, a '%' that starts no escape kept. Never an exception,
+ * so a key that does not decode costs what one that does costs
+ * (decodeURIComponent throws for each).
  */
 function formKey(raw: string): string {
-  return raw.replace(ESCAPES, (run) => Buffer.from(run.replaceAll('%', ''), 'hex').toString('utf8'));
+  return raw
+    .replaceAll('+', ' ')
+    .replace(ESCAPES, (run) => Buffer.from(run.replaceAll('%', ''), 'hex').toString('utf8'));
 }
 
 /**
  * A value that is wholly a form-encoded list (key=value&key=value with no
  * whitespace, as axios sends a URLSearchParams body) with the value of each
- * sensitive key masked; any other text, or a form with nothing to mask, is
- * returned as it came.
+ * sensitive key masked (the form keys of isSensitive included); any other
+ * text, or a form with nothing to mask, is returned as it came.
  */
 function maskForm(text: string, redact: RedactOptions): string {
   const form = text.trim();
@@ -317,7 +338,7 @@ function maskForm(text: string, redact: RedactOptions): string {
     .split('&')
     .map((pair) => {
       const equals = pair.indexOf('=');
-      return equals > 0 && isSensitive(formKey(pair.slice(0, equals)), redact)
+      return equals > 0 && isSensitive(formKey(pair.slice(0, equals)), redact, true)
         ? `${pair.slice(0, equals + 1)}${placeholder(redact)}`
         : pair;
     })
@@ -404,6 +425,11 @@ const STACK_FRAME = /^\s+at /;
 /** A node error code, as node writes one in its own errors' stack header ('RangeError [ERR_OUT_OF_RANGE]: ...'). */
 const NODE_ERROR_CODE = /^[A-Z][A-Z0-9_]*$/;
 
+/** An Error's name as V8 reads it for a header: 'Error' when it has none. */
+function errorLabel(name: unknown): string {
+  return name === undefined ? 'Error' : String(name);
+}
+
 /** The header V8 writes for a name and a message: 'name: message', the name alone for no message, the message alone for no name. */
 function stackHeader(name: string, message: string): string {
   if (name === '') return message;
@@ -431,7 +457,7 @@ function errorShape(
   if (typeof stack !== 'string') return { name, message, stack };
   const text = typeof message === 'string' ? message : '';
   const printed = redactText(text, redact, nesting, inUrl, budget);
-  const label = name === undefined ? 'Error' : String(name);
+  const label = errorLabel(name);
   const code = (error as { code?: unknown }).code;
   const coded = typeof code === 'string' && NODE_ERROR_CODE.test(code) ? `${label} [${code}]` : label;
   const lines = stack.split('\n');
@@ -558,6 +584,8 @@ function shapeValues(
   const inUrl = new WeakSet<object>();
   return function shape(this: unknown, key: string, value: unknown): unknown {
     const holder = this as Record<string, unknown>;
+    // A key that names a secret (sig and the other query keys included) has its value masked, unread.
+    if (isSensitive(key, redact)) return placeholder(redact);
     // Under a URL-named key every value is a URL value, so a URL root makes them all one.
     const urlValued = rootInUrl || isUrlKey(key) || inUrl.has(holder);
     if (typeof value === 'string') return redactText(value, redact, nesting, urlValued, budget);
@@ -812,7 +840,7 @@ const PRINTF = /%[sdifjoOc]/;
 
 function consoleArg(arg: unknown, redact: RedactOptions): string {
   if (typeof arg === 'string') return redactText(arg, redact);
-  if (arg instanceof Error) return `${arg.name}: ${sanitizeLogValue(printValue(arg.message, redact))}`;
+  if (arg instanceof Error) return stackHeader(errorLabel(arg.name), sanitizeLogValue(printValue(arg.message, redact)));
   return sanitizeLogValue(printValue(arg, redact));
 }
 
@@ -858,8 +886,10 @@ function bridgeArgs(args: unknown[], redact: RedactOptions): [Record<string, unk
  * compact; URLs lose query, fragment and userinfo; objects (plain, class
  * instances such as AxiosHeaders, Errors) are key-redacted in their JSON form,
  * and one that hides itself from util.inspect prints as `[ClassName]`. An
- * Error prints as `name: message`, or as {name, message, stack} under
- * %o/%O/%j/%s, its message (the stack's copy too) printed as any text is.
+ * Error prints as V8 writes its header (`name: message`, the message alone
+ * for an empty name, the name alone for an empty message), or as {name,
+ * message, stack} under %o/%O/%j/%s, its message (the stack's copy too)
+ * printed as any text is.
  * Other text, the format string included, is covered by the same policy as
  * msg: the secret-shape patterns (Bearer, JWT, ...), the URL stripping, and
  * the header-line and form rules where the whole text is one.

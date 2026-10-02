@@ -123,7 +123,13 @@ argument) goes through one policy, with the logger's own options. An Error's
 message is printed by it wherever it appears: as `err.message`, in `msg`
 (`console.error(err)`, `log.info('failed', err)`) and in its stack. A key that
 names a secret (`password`, `token`, `cookie` ...) has its value masked, also
-when printing changes the key (`/login?token` prints as `/login`). `call` is
+when printing changes the key (`/login?token` prints as `/login`). The query
+and form keys `sig`, `signature` and `code_verifier`, as a word of the key
+(`X-Amz-Signature`, `urlSig`, `codeVerifier`), name a secret too, whatever key
+pattern a service gives: as an object key at any depth, a form key and the
+name of a header line. `code` (an OAuth code) names one only as a form key: as
+an object key it is the log shape's own field, an error's code and a word of
+`statusCode`, so a parsed query's `code` (`{ q: req.query }`) prints. `call` is
 also cut at its first `?` or `#`.
 
 - a `scheme://` or `//` URL anywhere in the text loses its userinfo, and its
@@ -141,13 +147,15 @@ also cut at its first `?` or `#`.
   `target`, `endpoint`, `location`, `referer`, `redirect`, their plurals, and
   keys made of them such as `imageUrl` or `redirect_uri`), at any depth and
   through arrays and objects under it, is cut at its first `?` or `#` before
-  any other rule reads it;
+  any other rule reads it (a value that is a whole JSON document is parsed
+  first, and each string in it is cut);
 - a header line (`Cookie: ...` at the start of a line) and a raw header list
   (`rawHeaders`: name, value, ...) have each sensitive header's value masked;
 - a value that is wholly a form-encoded list (`key=value&key=value`, no
   whitespace, as axios sends a `URLSearchParams` body) has the value of each
-  sensitive key masked, the key read as a server reads it (`api%5Fkey` is
-  `api_key`; an escape that is not UTF-8 is read as U+FFFD, never an error);
+  sensitive key masked, the key read as a server reads it (`+` is a space,
+  `api%5Fkey` is `api_key`; an escape that is not UTF-8 is read as U+FFFD,
+  never an error);
 - a string that is, as a whole, a JSON object or array is key-redacted and
   made compact (JSON inside such a string too, up to four levels);
 - an object is key-redacted in its JSON form (`toJSON` honoured): an Error
@@ -173,14 +181,16 @@ also cut at its first `?` or `#`.
   `[unserializable]`; a log call never throws for what it was given.
 
 Other free text is masked only by the secret-shape patterns (Bearer, JWT,
-...): a secret in prose, JSON or a form embedded in a longer sentence, a path
-in the middle of a sentence (`see /docs?page=2`), or query parameters held
-without a `?` (`{ query: 'sig=...' }`, axios `config.params`) whose names are
-not sensitive (`sig`), are left as written.
+...): a secret in prose, JSON or a form embedded in a longer sentence (text
+that holds `key=value` pairs is read as a form only when it is one as a whole,
+so `retry with code=...&sig=...` prints), and a path in the middle of a
+sentence with its query (`see /docs?page=2`, `fetch /x?sig=... failed`), are
+left as written.
 
 A child logger given an empty or unknown level, or one that is not a string,
-keeps its parent's level, as pino's does for the first two: Fastify 5 passes
-`{ level: '' }` for every request.
+keeps its parent's level and never throws (Fastify 5 passes `{ level: '' }`
+for every request); pino's keeps it for an empty level and throws for an
+unknown one.
 
 **Console bridge.** `installConsoleBridge(logger)` turns `console.*` into
 `app.console` lines, redacted as above: a leading `[TAG]` (e.g.
