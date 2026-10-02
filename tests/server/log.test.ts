@@ -1841,7 +1841,7 @@ describe('the query and form keys code, code_verifier, sig and signature are sen
     expect(custom.parsed()[0]).toMatchObject({ query: 'sig=[REDACTED]&page=2&dpop=[REDACTED]', q: '{"codeVerifier":"[REDACTED]"}' });
   });
 
-  it('sig, signature and code_verifier also as an object key at any depth and a header name; code only in a form', () => {
+  it('sig, signature and code_verifier also as an object key at any depth and a header name', () => {
     const { log, lines, parsed } = logger();
     log.info({
       q: { sig: 'hunter61', page: '2' },
@@ -1849,9 +1849,11 @@ describe('the query and form keys code, code_verifier, sig and signature are sen
       params: { 'X-Amz-Signature': 'hunter62', codeVerifier: 'hunter63' },
       signature: 'hunter64',
       headers: 'Signature: sig1=:hunter65:',
+      words: { q: { sig_v4: 'hunter87', code_verifier_raw: 'hunter88' } },
+      req: { rawHeaders: ['Host', 'h.example', 'X-Amz-Signature', 'hunter89'] },
     });
-    // As an object key, code is the log shape's own field and an error's code, so a parsed query's code prints.
-    log.info({ error: { code: 'ENOENT' }, query: { code: 'oauth-code' }, signal: 'kept', design: 'kept', sigma: 'kept' });
+    // A parsed query's code is masked.
+    log.info({ query: { code: 'oauth-code' }, signal: 'kept', design: 'kept', sigma: 'kept' });
     // A form inside a longer text is not read as one.
     log.info({ prose: 'retry with code=visible&sig=visible' });
     expect(lines.join('\n')).not.toMatch(/hunter/);
@@ -1862,15 +1864,89 @@ describe('the query and form keys code, code_verifier, sig and signature are sen
       params: JSON.stringify({ 'X-Amz-Signature': '[REDACTED]', codeVerifier: '[REDACTED]' }),
       signature: '[REDACTED]',
       headers: 'Signature: [REDACTED]',
+      words: JSON.stringify({ q: { sig_v4: '[REDACTED]', code_verifier_raw: '[REDACTED]' } }),
+      req: JSON.stringify({ rawHeaders: ['Host', 'h.example', 'X-Amz-Signature', '[REDACTED]'] }),
     });
     expect(coded).toMatchObject({
-      error: JSON.stringify({ code: 'ENOENT' }),
-      query: JSON.stringify({ code: 'oauth-code' }),
+      query: JSON.stringify({ code: '[REDACTED]' }),
       signal: 'kept',
       design: 'kept',
       sigma: 'kept',
     });
     expect(prose.prose).toBe('retry with code=visible&sig=visible');
+  });
+
+  it('an OAuth code key in an object at any depth masks a string or an array; a number, null or an object prints', () => {
+    const { log, lines, parsed } = logger();
+    // Where an OAuth code arrives: a parsed query (also repeated), axios config.params, a JSON body, a token request.
+    log.info({
+      q: { code: 'hunter70', state: 's' },
+      repeated: { code: ['hunter71', 'hunter72'] },
+      config: { params: { code: 'hunter73', sig: 'hunter74' } },
+      body: JSON.stringify({ code: 'hunter75', grant_type: 'authorization_code' }),
+      grant: { auth_code: 'hunter76', deviceCode: 'hunter77', user_code: 'HUNTER-78', Code: 'hunter79' },
+      // Any string: a reset code reads as an error code does.
+      shapes: { reset: { code: '493817' }, steam: { code: 'HUNTER80' }, error: { code: 'ENOENT' } },
+    });
+    log.info({ authCode: 'hunter81' }, 'callback');
+    const custom = logger({ redact: { sensitiveKeyPattern: /dpop/i } });
+    custom.log.info({ q: { authorization_code: 'hunter82' } });
+    // The key as given decides: past the string cap 'code' and spaces prints as 'code …[truncated]'.
+    const capped = logger({ redact: { maxStringLength: 16 } });
+    const padded = `code${' '.repeat(20)}`;
+    capped.log.info({ cut: { [padded]: 'hunter83' } });
+    capped.log.info({ [padded]: 'hunter84' });
+    // A number, a boolean, null and an object print; code as another word of a key is not an OAuth code.
+    log.info({
+      grpc: { code: 14, details: 'shown-0' },
+      flags: { code: true, none: { code: null } },
+      object: { code: { reason: 'shown-1' } },
+      words: {
+        jan_code: '4580590123456',
+        statusCode: 404,
+        status_code: '404',
+        error_code: 'card_declined',
+        code_name: 'DuplicateKey',
+        barcode: 'x1-y',
+        codec: 'h264',
+        codes: ['a-b'],
+      },
+      headers: 'Code: shown-2',
+    });
+    log.info({ event: 'rpc.in', call: 'a.v1.S/M', code: 'internal', duration_ms: 1, peer: 'unmeshed' });
+    expect([...lines, ...custom.lines, ...capped.lines].join('\n')).not.toMatch(/hunter/i);
+    const [masked, top, shown, reserved] = parsed();
+    expect(masked).toMatchObject({
+      q: JSON.stringify({ code: '[REDACTED]', state: 's' }),
+      repeated: JSON.stringify({ code: '[REDACTED]' }),
+      config: JSON.stringify({ params: { code: '[REDACTED]', sig: '[REDACTED]' } }),
+      body: JSON.stringify({ code: '[REDACTED]', grant_type: 'authorization_code' }),
+      grant: JSON.stringify({ auth_code: '[REDACTED]', deviceCode: '[REDACTED]', user_code: '[REDACTED]', Code: '[REDACTED]' }),
+      shapes: JSON.stringify({ reset: { code: '[REDACTED]' }, steam: { code: '[REDACTED]' }, error: { code: '[REDACTED]' } }),
+    });
+    expect(top.auth_code).toBe('[REDACTED]');
+    expect(custom.parsed()[0].q).toBe(JSON.stringify({ authorization_code: '[REDACTED]' }));
+    const [nested, flat] = capped.parsed();
+    expect(Object.values(JSON.parse(nested.cut as string))).toEqual(['[REDACTED]']);
+    expect(flat.code_truncated).toBe('[REDACTED]');
+    expect(shown).toMatchObject({
+      grpc: JSON.stringify({ code: 14, details: 'shown-0' }),
+      flags: JSON.stringify({ code: true, none: { code: null } }),
+      object: JSON.stringify({ code: { reason: 'shown-1' } }),
+      words: JSON.stringify({
+        jan_code: '4580590123456',
+        statusCode: 404,
+        status_code: '404',
+        error_code: 'card_declined',
+        code_name: 'DuplicateKey',
+        barcode: 'x1-y',
+        codec: 'h264',
+        codes: ['a-b'],
+      }),
+      headers: 'Code: shown-2',
+    });
+    // The log shape's own code field is a Connect code name or an HTTP status, never masked.
+    expect(reserved.code).toBe('internal');
   });
 
   it('reads a long key that holds sig or code at about the cost of a plain key, on every path a key takes', () => {
@@ -2144,7 +2220,7 @@ describe('printing a value never throws and stays bounded', () => {
       log.child({ err: proxy }).info('bound');
       log.info(proxy);
       log.warn('x', proxy);
-      log.error({ p: proxy }, 'field');
+      log.error({ p: proxy, authCode: proxy }, 'field');
       target.log(proxy);
       target.log('%o', proxy);
     }).not.toThrow();
@@ -2158,7 +2234,7 @@ describe('printing a value never throws and stays bounded', () => {
       ['info', '[unserializable]'],
       ['info', '[unserializable]'],
     ]);
-    expect(out[3].p).toBe('[unserializable]');
+    expect(out[3]).toMatchObject({ p: '[unserializable]', auth_code: '[unserializable]' });
     expect(out.map((line) => line.event)).toEqual(['app.log', 'app.log', 'app.log', 'app.log', 'app.console', 'app.console']);
     out.forEach(expectValidLine);
   });
