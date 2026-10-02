@@ -16,6 +16,7 @@ import {
   ROOT_CONTEXT,
   SpanKind,
   context,
+  createTraceState,
   propagation,
   trace,
   type TextMapPropagator,
@@ -91,6 +92,9 @@ describe('createHostAllowlist', () => {
     'https://Scraper.FC.svc:443/ingest',
     ' scraper.fc.svc. ',
     ' http://scraper.fc.svc:3050 ',
+    'HTTP://Scraper.fc.svc',
+    'scraper.fc.svc?x=1',
+    'scraper.fc.svc#frag',
   ])('reads the host of an entry written as %s', (entry) => {
     const matcher = createHostAllowlist([entry]);
     expect(matcher('scraper.fc.svc')).toBe(true);
@@ -233,8 +237,12 @@ describe('AllowlistPropagator on synthetic contexts', () => {
 
 interface Received {
   traceparent: string | null;
+  tracestate: string | null;
   baggage: string | null;
 }
+
+/** An upstream tracestate: a request that wrongly carried trace context would carry it too. */
+const UPSTREAM_TRACESTATE = 'vendor=state-1';
 
 describe('AllowlistPropagator with real fetch (undici instrumentation, in-process)', () => {
   const exporter = new InMemorySpanExporter();
@@ -252,6 +260,7 @@ describe('AllowlistPropagator with real fetch (undici instrumentation, in-proces
     server = http.createServer((req, res) => {
       received[(req.url ?? '').split('?')[0]] = {
         traceparent: (req.headers.traceparent as string | undefined) ?? null,
+        tracestate: (req.headers.tracestate as string | undefined) ?? null,
         baggage: (req.headers.baggage as string | undefined) ?? null,
       };
       res.end('ok');
@@ -268,7 +277,14 @@ describe('AllowlistPropagator with real fetch (undici instrumentation, in-proces
   async function fetchInSpan(url: string): Promise<void> {
     const tracer = trace.getTracer('probe');
     const bag = propagation.createBaggage({ 'fc.run_id': { value: 'run-1' } });
-    await tracer.startActiveSpan('parent', async (span) => {
+    const upstream = trace.setSpanContext(ROOT_CONTEXT, {
+      traceId: 'a'.repeat(32),
+      spanId: 'b'.repeat(16),
+      traceFlags: 1,
+      isRemote: true,
+      traceState: createTraceState(UPSTREAM_TRACESTATE),
+    });
+    await tracer.startActiveSpan('parent', {}, upstream, async (span) => {
       await context.with(propagation.setBaggage(context.active(), bag), async () => {
         const response = await fetch(url);
         await response.text();
@@ -277,15 +293,16 @@ describe('AllowlistPropagator with real fetch (undici instrumentation, in-proces
     });
   }
 
-  it('sends traceparent and baggage to localhost', async () => {
+  it('sends traceparent, tracestate and baggage to localhost', async () => {
     await fetchInSpan(`http://localhost:${port}/allowed?sig=1`);
-    expect(received['/allowed'].traceparent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+    expect(received['/allowed'].traceparent).toMatch(/^00-a{32}-[0-9a-f]{16}-01$/);
+    expect(received['/allowed'].tracestate).toBe(UPSTREAM_TRACESTATE);
     expect(received['/allowed'].baggage).toBe('fc.run_id=run-1');
   });
 
-  it('sends neither to a host outside the allowlist and records no client span for it', async () => {
+  it('sends none of them to a host outside the allowlist and records no client span for it', async () => {
     await fetchInSpan(`http://127.0.0.1:${port}/denied?sig=2`);
-    expect(received['/denied']).toEqual({ traceparent: null, baggage: null });
+    expect(received['/denied']).toEqual({ traceparent: null, tracestate: null, baggage: null });
 
     await tracing.forceFlush();
     const client = exporter
@@ -319,7 +336,9 @@ describe('AllowlistPropagator with real node:http and fetch (child process, buil
       const received = {};
       const server = http.createServer((req, res) => {
         received[req.url.split('?')[0]] = {
-          traceparent: req.headers.traceparent || null, baggage: req.headers.baggage || null,
+          traceparent: req.headers.traceparent || null,
+          tracestate: req.headers.tracestate || null,
+          baggage: req.headers.baggage || null,
         };
         res.end('ok');
       });
@@ -339,7 +358,11 @@ describe('AllowlistPropagator with real node:http and fetch (child process, buil
         port = server.address().port;
         const tracer = api.trace.getTracer('probe');
         const bag = api.propagation.createBaggage({ 'fc.run_id': { value: 'run-1' } });
-        await tracer.startActiveSpan('parent', async (span) => {
+        const upstream = api.trace.setSpanContext(api.ROOT_CONTEXT, {
+          traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), traceFlags: 1, isRemote: true,
+          traceState: api.createTraceState('${UPSTREAM_TRACESTATE}'),
+        });
+        await tracer.startActiveSpan('parent', {}, upstream, async (span) => {
           await api.context.with(api.propagation.setBaggage(api.context.active(), bag), async () => {
             await get('localhost', '/http-localhost?sig=1');
             await get('scraper.fc.svc', '/http-svc');
@@ -362,19 +385,18 @@ describe('AllowlistPropagator with real node:http and fetch (child process, buil
     result = JSON.parse(runNodeCjs(script)) as typeof result;
   }, BUILD_BUDGET_MS);
 
-  it('node:http carries traceparent and baggage to localhost, *.svc and *.svc.cluster.local, in one trace', () => {
+  it('node:http carries traceparent, tracestate and baggage to localhost, *.svc and *.svc.cluster.local, in one trace', () => {
     const allowed = ['/http-localhost', '/http-svc', '/http-cluster-local'].map((path) => result.received[path]);
     for (const headers of allowed) {
-      expect(headers.traceparent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+      expect(headers.traceparent).toMatch(/^00-a{32}-[0-9a-f]{16}-01$/);
+      expect(headers.tracestate).toBe(UPSTREAM_TRACESTATE);
       expect(headers.baggage).toBe('fc.run_id=run-1');
     }
-    const traceIds = new Set(allowed.map((headers) => (headers.traceparent as string).split('-')[1]));
-    expect(traceIds.size).toBe(1);
   });
 
-  it('node:http and fetch send no trace header to a loopback IP or a store CDN name', () => {
+  it('node:http and fetch send no traceparent, tracestate or baggage to a loopback IP or a store CDN name', () => {
     for (const path of ['/http-loopback-ip', '/http-store-cdn', '/fetch-loopback-ip']) {
-      expect({ path, ...result.received[path] }).toEqual({ path, traceparent: null, baggage: null });
+      expect({ path, ...result.received[path] }).toEqual({ path, traceparent: null, tracestate: null, baggage: null });
     }
   });
 

@@ -68,6 +68,7 @@ describe('log-shape.schema.json', () => {
     ['a winner_trace_id that is not a trace id', { ...EXAMPLE_JOB_END, event: 'app.log', winner_trace_id: 'not-a-trace-id' }],
     ['a zeroed winner_trace_id', { ...EXAMPLE_JOB_END, event: 'app.log', winner_trace_id: '0'.repeat(32) }],
     ['an uppercase winner_trace_id', { ...EXAMPLE_JOB_END, event: 'app.log', winner_trace_id: TRACE_ID.toUpperCase() }],
+    ['a 33-hex winner_trace_id', { ...EXAMPLE_JOB_END, event: 'app.log', winner_trace_id: `${TRACE_ID}a` }],
     ['a query string in call', { ...EXAMPLE_RPC_IN, call: 'POST /ingest/scrape?token=1' }],
     ['a zeroed trace_id', { ...EXAMPLE_RPC_IN, trace_id: '0'.repeat(32) }],
     ['a zeroed span_id', { ...EXAMPLE_RPC_IN, span_id: '0'.repeat(16) }],

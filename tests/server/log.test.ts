@@ -277,6 +277,61 @@ describe('server log line shape', () => {
     ]);
   });
 
+  it('prints the reserved call, code, peer, job and event values by the same policy as any value', () => {
+    const { log, lines, parsed } = logger();
+    log.info({
+      event: 'http.out',
+      call: 'GET https://user:SECRET1@h.example/x?sig=SECRET2',
+      code: 'https://h.example/x?sig=SECRET3',
+      duration_ms: 1,
+      peer: 'https://user:SECRET4@h.example',
+      job: { token: 'SECRET5', name: 'nightly' },
+    });
+    log.info({
+      event: 'app.x https://h.example/x?sig=SECRET6',
+      call: 'lookup?token=SECRET9',
+      peer: { password: 'SECRET7' },
+      job: 'crawl https://h.example/?k=SECRET8',
+    });
+    const out = parsed();
+    expect(out[0]).toMatchObject({
+      call: 'GET https://h.example/x',
+      code: 'https://h.example/x',
+      peer: 'https://h.example',
+      job: '{"token":"[REDACTED]","name":"nightly"}',
+    });
+    expect(out[1]).toMatchObject({
+      event: 'app.x https://h.example/x',
+      call: 'lookup',
+      peer: '{"password":"[REDACTED]"}',
+      job: 'crawl https://h.example/',
+    });
+    expect(lines.join('\n')).not.toContain('SECRET');
+  });
+
+  it('keeps a bridged line an app.console line when its Error cannot be read', () => {
+    const unreadable = new Error('x');
+    Object.defineProperty(unreadable, 'message', {
+      get() {
+        throw new Error('getter threw');
+      },
+    });
+    const { log, target, uninstall, parsed } = bridged();
+    target.error('%s', unreadable);
+    log.error({ err: unreadable }, 'field');
+    // A printed value that starts with a bracket is the message, not a [TAG].
+    target.log(Buffer.from('x'));
+    uninstall();
+    const out = parsed();
+    expect(out.map((line) => [line.event, line.msg, line.tag])).toEqual([
+      ['app.console', '[unserializable]', undefined],
+      ['app.log', 'field', undefined],
+      ['app.console', '[binary]', undefined],
+    ]);
+    expect(out[0].err).toEqual({ type: 'Error', message: '[unserializable]' });
+    expect(out[1].err).toEqual({ type: 'Error', message: '[unserializable]' });
+  });
+
   it('keeps the owned keys owned: callers cannot override time, level, service, version or ids', () => {
     const { log, parsed } = logger();
     log.info({
@@ -803,10 +858,57 @@ describe('URLs in log output lose their query, fragment and userinfo (plan-v2 pr
     ['a URL glued to a word', 'src=https://x.example/a?sig=SECRET', 'src=https://x.example/a'],
     ['two URLs', 'from https://a.example/?k=SECRET to http://b.example/c#SECRET', 'from https://a.example/ to http://b.example/c'],
     ['a quoted URL', "open 'https://x.example/a?sig=SECRET' now", "open 'https://x.example/a' now"],
+    // A query runs to the next space, never to a quote: encodeURIComponent leaves an apostrophe raw.
+    ['a query holding an apostrophe (the plan-v2 U1 acceptance URL)', `https://x.example/a/b?q=${encodeURIComponent("it's")}&sig=SECRET#f`, 'https://x.example/a/b'],
+    [
+      "the scraper initiator's lookup URL for a title with an apostrophe",
+      `http://scraper.fc.svc:3050/lookup?q=${encodeURIComponent("JoJo's Bizarre Adventure")}&mode=screen&token=SECRET`,
+      'http://scraper.fc.svc:3050/lookup',
+    ],
+    ['a query holding a double quote', 'https://store.example/search?q=say"hi"&sig=SECRET', 'https://store.example/search'],
+    ['a query holding < and >', 'https://store.example/search?q=<b>&sig=SECRET', 'https://store.example/search'],
+    ['a query holding a backtick', 'https://store.example/search?q=a`b&sig=SECRET', 'https://store.example/search'],
+    ['a query holding an apostrophe inside text', "retry https://x.example/a?q=it's&sig=SECRET in 5s", 'retry https://x.example/a in 5s'],
+    ['an apostrophe in the path inside text', "see https://x.example/it's/a?sig=SECRET now", "see https://x.example/it's/a now"],
+    ['a double-quoted URL, keeping the closing quote', 'open "https://x.example/a?q=say"hi"&sig=SECRET" now', 'open "https://x.example/a" now'],
+    ['a URL in brackets, keeping the closing ones', 'see (https://x.example/a?sig=SECRET).', 'see (https://x.example/a).'],
+    ['a URL in JSON inside text', 'body {"url":"https://x.example/a?sig=SECRET"} end', 'body {"url":"https://x.example/a"} end'],
+    // A whole value with no space that is a host or path with a query, with no scheme.
+    ['a host and path with no scheme', 'img.store.example/a.jpg?X-Amz-Signature=SECRET', 'img.store.example/a.jpg'],
+    ['a relative path with no leading slash', 'api/v1/items?sig=SECRET', 'api/v1/items'],
+    ['a host and port with no scheme', 'localhost:3000/a?sig=SECRET', 'localhost:3000/a'],
+    ['a scheme with no slashes', 'mailto:ross@x.example?subject=SECRET', 'mailto:ross@x.example'],
+    ['a scheme with one slash', 'https:/x.example/a?sig=SECRET', 'https:/x.example/a'],
+    ['backslashes for slashes', 'https:\\\\x.example\\a?sig=SECRET', 'https:\\\\x.example\\a'],
+    ['userinfo holding an apostrophe', "https://u:pa'ss@h.example/x", 'https://h.example/x'],
+    ['a host with no path and no scheme', 'cdn.example?sig=SECRET', 'cdn.example'],
+    ['an upper-case host with no path and no scheme', 'CDN.Example?sig=SECRET', 'CDN.Example'],
+    ['an IP address and port with no scheme', '10.0.0.5:8080?sig=SECRET', '10.0.0.5:8080'],
+    ['a path whose query holds a space', 'api/v1/items?q=hello world&sig=SECRET', 'api/v1/items'],
+    ['a URL whose query runs past a line break', 'https://h.example/a?x=1\nsig=SECRET', 'https://h.example/a'],
+    ['a scheme ending in digits, inside text', 'see svc12345://h.example/a?sig=SECRET now', 'see svc12345://h.example/a now'],
+    ['a bare query string', '?access_token=SECRET&state=1', ''],
+    ['a bare fragment of key=value pairs', '#access_token=SECRET', ''],
+    ['a request line', 'POST /login?sig=SECRET HTTP/1.1', 'POST /login HTTP/1.1'],
+    ['a request line inside text', 'got GET /items?sig=SECRET 200 in 5 ms', 'got GET /items 200 in 5 ms'],
+    ['a request target in brackets', 'retry (PUT /items/1#SECRET).', 'retry (PUT /items/1).'],
+    ['an upper-case scheme inside text', 'see HTTPS://X.EXAMPLE/A?SIG=SECRET now', 'see HTTPS://X.EXAMPLE/A now'],
+    [
+      'URLs closed by brackets and punctuation',
+      'see <https://a.example/x?s=SECRET>, [https://b.example/y?s=SECRET]; `https://c.example/z?s=SECRET`: https://d.example/w?s=SECRET!',
+      'see <https://a.example/x>, [https://b.example/y]; `https://c.example/z`: https://d.example/w!',
+    ],
+    ['a Windows-style path', 'dir\\sub\\file.txt?sig=SECRET', 'dir\\sub\\file.txt'],
+    ['a padded bare query string', '  ?token=SECRET ', ''],
+    ...['HEAD', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH'].map((method) => [
+      `a ${method} request line`,
+      `${method} /x?sig=SECRET HTTP/1.1`,
+      `${method} /x HTTP/1.1`,
+    ]),
   ])('strips %s', (_label, value, expected) => {
     const { log, lines, parsed } = logger();
-    log.info({ link: value });
-    expect(parsed()[0].link).toBe(expected);
+    log.info({ note: value });
+    expect(parsed()[0].note).toBe(expected);
     expect(lines[0]).not.toContain('SECRET');
   });
 
@@ -818,10 +920,225 @@ describe('URLs in log output lose their query, fragment and userinfo (plan-v2 pr
     ['a path followed by text', '/a b?c'],
     ['a path inside text', 'see /docs?page=2 for more'],
     ['a padded number (JSON, but not an object or array)', ' 42 '],
+    ['a word ending in a question mark', 'ready?'],
+    ['a numbered item', 'item#3'],
+    ['a URL at the end of a sentence', 'see https://x.example/a.'],
+    ['a hashtag in text', '#3 in the queue'],
+    ['a label and a question', 'Q: why?'],
+    ['an HTTP method in lower case', 'get /items?page=2 later'],
+    ['a request line with no query', 'GET /items HTTP/1.1'],
+    ['a header name inside prose', 'the cookie: header was missing'],
+    ['an abbreviation with a question mark', 'e.g.?'],
+    ['a bracketed question', '(Q:why?)'],
+    ['a numbered note holding an =', '#1 retry with x=2'],
+    ['a method name inside a word', 'BUDGET /items?page=2 later'],
+    ['a word that starts with a method name', 'POSTER? no'],
   ])('leaves %s alone', (_label, value) => {
     const { log, parsed } = logger();
-    log.info({ link: value });
-    expect(parsed()[0].link).toBe(value);
+    log.info({ note: value });
+    expect(parsed()[0].note).toBe(value);
+  });
+
+  it.each([
+    // axios's config.url, relative to a baseURL (url 'login?...' with config.baseURL set).
+    ['url', 'login?access_token=SECRET', 'login'],
+    ['url', 'https://store.example/search?q=hello world&sig=SECRET', 'https://store.example/search'],
+    ['url', "https://x.example/a/b?q=it's&sig=SECRET#f", 'https://x.example/a/b'],
+    ['url', 'https://u:SECRET@x.example/a', 'https://x.example/a'],
+    ['url', 'https://x.example/a?q=(SECRET)', 'https://x.example/a'],
+    ['imageUrl', 'img.example/a.jpg?sig=SECRET', 'img.example/a.jpg'],
+    ['uri', 'items?page=2&sig=SECRET', 'items'],
+    ['href', 'next #SECRET', 'next'],
+    ['redirectUri', 'https://x.example/cb?code=SECRET', 'https://x.example/cb'],
+    ['link', 'why? SECRET', 'why'],
+    ['path', 'items?sig=SECRET', 'items'],
+    ['target', 'orders?sig=SECRET', 'orders'],
+    ['endpoint', 'orders#SECRET', 'orders'],
+    ['location', 'next?sig=SECRET', 'next'],
+    ['referer', 'page?sig=SECRET', 'page'],
+    ['redirect', 'home?sig=SECRET', 'home'],
+    ...['uris', 'hrefs', 'paths', 'endpoints', 'referrer', 'redirects'].map((key) => [key, 'a?SECRET', 'a']),
+    // A key of several words, one of them URL-named; the value does not look like a URL.
+    ['nextPageUrl', 'page 2?cursor=SECRET', 'page 2'],
+  ])('cuts a %s field at its first ? or # (%s)', (key, value, expected) => {
+    const { log, lines, parsed } = logger();
+    log.info({ [key]: value });
+    expect(parsed()[0][toSnakeCase(key)]).toBe(expected);
+    expect(lines[0]).not.toContain('SECRET');
+  });
+
+  it('cuts URL-named keys at any depth, the arrays under them and the JSON strings holding them', () => {
+    const { log, lines, parsed } = logger();
+    log.info({
+      config: { baseURL: 'http://h.example/api/', url: 'login?access_token=SECRET1', method: 'post' },
+      page: { links: ['next page?cursor=SECRET2', ['prev#SECRET3']], title: 'why? because' },
+      body: '{"redirect_uri":"cb?code=SECRET4"}',
+      images: [{ src: 'x', href: "a.jpg?q=it's&sig=SECRET5" }],
+      urls: ['a b?SECRET6'],
+      hrefs: '["next?cursor=SECRET7"]',
+      paging: { nextPageUrl: 'page 2?cursor=SECRET8' },
+    });
+    const [line] = parsed();
+    expect(line.config).toBe('{"baseURL":"http://h.example/api/","url":"login","method":"post"}');
+    expect(line.page).toBe('{"links":["next page",["prev"]],"title":"why? because"}');
+    expect(line.body).toBe('{"redirect_uri":"cb"}');
+    expect(line.images).toBe('[{"src":"x","href":"a.jpg"}]');
+    expect(line.urls).toBe('["a b"]');
+    expect(line.hrefs).toBe('["next"]');
+    expect(line.paging).toBe('{"nextPageUrl":"page 2"}');
+    expect(lines[0]).not.toContain('SECRET');
+  });
+
+  it('cuts URL-named keys in bridged and printf arguments and in the text format', () => {
+    const { target, uninstall, lines, msgs } = bridged();
+    target.log('%o', { url: 'login?access_token=SECRET1' });
+    target.log('retry', { config: { url: "a b?q=it's&sig=SECRET2" } });
+    uninstall();
+    expect(msgs()).toEqual(["{ url: 'login' }", 'retry {"config":{"url":"a b"}}']);
+    const text = logger({ format: 'text' });
+    text.log.info({ url: "https://h.example/a?q=it's&sig=SECRET3" }, 'm');
+    expect(text.lines[0]).toMatch(/ m url=https:\/\/h\.example\/a$/);
+    expect([...lines, ...text.lines].join('\n')).not.toContain('SECRET');
+  });
+
+  it('strips URLs used as object keys, nested and at the top level', () => {
+    const { log, lines, parsed } = logger();
+    log.info({
+      statuses: { 'https://cdn.example/a.jpg?X-Amz-Signature=SECRET1': 403, plain: 200 },
+      'https://cdn.example/b.jpg?sig=SECRET2': 404,
+    });
+    const [line] = parsed();
+    expect(line.statuses).toBe('{"https://cdn.example/a.jpg":403,"plain":200}');
+    expect(line.https_cdn_example_b_jpg).toBe(404);
+    expect(lines[0]).not.toMatch(/secret/i);
+  });
+
+  it('prints a query holding an apostrophe without it in msg, err.message, bridged and text output', () => {
+    const url = `https://x.example/a/b?q=${encodeURIComponent("it's")}&sig=SECRET#f`;
+    const { log, target, uninstall, lines, msgs } = bridged();
+    log.info(`fetch ${url} failed`);
+    log.error(new Error(`GET ${url} failed`));
+    target.log(`retry ${url}`);
+    target.log('retry %s', url);
+    uninstall();
+    expect(msgs()).toEqual([
+      'fetch https://x.example/a/b failed',
+      'GET https://x.example/a/b failed',
+      'retry https://x.example/a/b',
+      'retry https://x.example/a/b',
+    ]);
+    const text = logger({ format: 'text' });
+    text.log.info({ link: url }, `open ${url}`);
+    expect(text.lines[0]).toMatch(/ open https:\/\/x\.example\/a\/b link=https:\/\/x\.example\/a\/b$/);
+    expect([...lines, ...text.lines].join('\n')).not.toMatch(/SECRET|#f|\?/);
+  });
+
+  it('masks the value of a sensitive header line and the query of a request line in a raw header block', () => {
+    const { log, lines, parsed } = logger();
+    log.info({
+      head: 'POST /login?sig=SECRET1 HTTP/1.1\r\nHost: h.example\r\nX-Api-Key: SECRET2\r\nCookie: sid=SECRET3\r\nAuthorization: Basic U0VDUkVUNA==',
+    });
+    log.info('Proxy-Authorization:Basic U0VDUkVUNQ==');
+    log.info({ note: 'Note: password rotation is due\nX-Request-Id: 42' });
+    log.info({ lone: 'x\rCookie: sid=SECRET4', spaced: 'Set-Cookie : sid=SECRET5', odd: 'X_Token2: SECRET6' });
+    const out = parsed();
+    expect(out[0].head).toBe(
+      'POST /login HTTP/1.1  Host: h.example  X-Api-Key: [REDACTED]  Cookie: [REDACTED]  Authorization: [REDACTED]',
+    );
+    expect(out[1].msg).toBe('Proxy-Authorization:[REDACTED]');
+    expect(out[2].note).toBe('Note: password rotation is due X-Request-Id: 42');
+    expect(out[3]).toMatchObject({ lone: 'x Cookie: [REDACTED]', spaced: 'Set-Cookie : [REDACTED]', odd: 'X_Token2: [REDACTED]' });
+    expect(lines.join('\n')).not.toMatch(/SECRET|U0VDUkVU/);
+  });
+
+  it('masks the value after a sensitive name in a raw header list (rawHeaders), under any key', () => {
+    const { log, lines, parsed } = logger();
+    // The values hold no sensitive word themselves: only the name before each one decides.
+    log.info({
+      raw: ['Host', 'h.example', 'Set-Cookie', 'sid=hunter1', 'Authorization', 'Basic aHVudGVyMg=='],
+      reversed: ['Cookie', 'sid=hunter3', 'Host', 'h.example'],
+      numbered: [7, 'seven', 'X-Api-Key', 'hunter4'],
+    });
+    log.info({ odd: ['token', 'kept', 'x'], spaced: ['the token', 'kept'], empty: [] });
+    const out = parsed();
+    expect(out[0].raw).toBe('["Host","h.example","Set-Cookie","[REDACTED]","Authorization","[REDACTED]"]');
+    expect(out[0].reversed).toBe('["Cookie","[REDACTED]","Host","h.example"]');
+    expect(out[0].numbered).toBe('[7,"seven","X-Api-Key","[REDACTED]"]');
+    // Not a header list: an odd length, or a name that is not a header name.
+    expect(out[1]).toMatchObject({ odd: '["token","kept","x"]', spaced: '["the token","kept"]', empty: '[]' });
+    expect(lines.join('\n')).not.toMatch(/hunter|aHVudGVy/);
+  });
+
+  it("masks header lines and header lists with the logger's own placeholder", () => {
+    const { log, parsed } = logger({ redact: { placeholder: '<hidden>' } });
+    log.info({ password: 'hunter1', head: 'Cookie: sid=hunter2', raw: ['Cookie', 'sid=hunter3'] });
+    expect(parsed()[0]).toMatchObject({ password: '<hidden>', head: 'Cookie: <hidden>', raw: '["Cookie","<hidden>"]' });
+  });
+
+  it('prints a node HTTP request, response or socket as a short summary, never its raw headers', async () => {
+    const { log, target, uninstall, lines, parsed } = bridged();
+    const server = http.createServer((req, res) => {
+      if (req.method === 'POST') {
+        log.info({ req }, 'in');
+        log.info(req, 'incoming');
+        target.log(req);
+        log.info({ raw: req.rawHeaders });
+        log.info({ socket: req.socket, res });
+        target.log(req.socket);
+      }
+      req.resume();
+      req.on('end', () => {
+        res.statusCode = 403;
+        res.setHeader('Set-Cookie', 'sid=SETCOOKIE-SECRET');
+        res.end('no');
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    // A relative url under a baseURL (config.url keeps only 'login?...'); the axios README's error handling logs error.request.
+    const err = (await axios
+      .post('login?access_token=QUERY-SECRET', { password: 'BODYPW-SECRET' }, {
+        baseURL: `http://127.0.0.1:${port}/api/`,
+        headers: { Authorization: 'Basic BASICAUTH-SECRET', 'X-Api-Key': 'APIKEY-SECRET', Cookie: 'sid=REQCOOKIE-SECRET' },
+      })
+      .catch((error: unknown) => error)) as AxiosError;
+    const response = await new Promise<http.IncomingMessage>((resolve) => {
+      http.get(`http://127.0.0.1:${port}/ping?sig=PING-SECRET`, resolve);
+    });
+    response.resume();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    expect(err).toBeInstanceOf(AxiosError);
+
+    log.warn({ url: err.config?.url, request: err.request, req: err.response?.request });
+    log.warn(err.response, 'failed');
+    log.warn({ config: err.config });
+    target.log(err.request);
+    target.error('failed %O', err.response?.request);
+    log.info({ response });
+    uninstall();
+
+    expect(lines).toHaveLength(12);
+    expect(lines.join('\n')).not.toMatch(/[A-Z]+-SECRET/);
+    const out = parsed();
+    const incoming = '{"method":"POST","url":"/api/login"}';
+    const outgoing = '{"method":"POST","host":"127.0.0.1","path":"/api/login"}';
+    expect(out[0].req).toBe(incoming);
+    expect(out[1].msg).toBe(`${incoming} incoming`);
+    expect(out[2].msg).toBe(incoming);
+    const raw = JSON.parse(out[3].raw as string) as string[];
+    expect(raw[raw.indexOf('Authorization') + 1]).toBe('[REDACTED]');
+    expect(raw[raw.indexOf('Cookie') + 1]).toBe('[REDACTED]');
+    expect(raw[raw.indexOf('X-Api-Key') + 1]).toBe('[REDACTED]');
+    expect(raw[raw.indexOf('Host') + 1]).toBe(`127.0.0.1:${port}`);
+    expect(out[4]).toMatchObject({ socket: '[Socket]', res: '{"statusCode":200}' });
+    expect(out[5]).toMatchObject({ msg: '[Socket]', event: 'app.console' });
+    expect(out[5]).not.toHaveProperty('tag');
+    expect(out[6]).toMatchObject({ url: 'login', request: outgoing, req: outgoing });
+    expect(out[7]).toMatchObject({ status: 403, request: outgoing, msg: 'failed' });
+    expect(out[8].config).toContain('"url":"login"');
+    expect(out[9].msg).toBe(outgoing);
+    expect(out[10].msg).toBe("failed { method: 'POST', host: '127.0.0.1', path: '/api/login' }");
+    expect(out[11].response).toBe('{"statusCode":403}');
   });
 
   it('strips URLs inside object fields, arrays and URL instances', () => {
@@ -947,6 +1264,13 @@ describe('JSON strings are key-redacted wherever they are printed', () => {
     expect(lines.join('\n')).not.toMatch(/hunter2|zzz-tok/);
   });
 
+  it('reads a JSON string that starts with a byte-order mark', () => {
+    const { log, lines, parsed } = logger();
+    log.info({ body: '﻿{"password":"hunter2"}' });
+    expect(parsed()[0].body).toBe('{"password":"[REDACTED]"}');
+    expect(lines[0]).not.toContain('hunter2');
+  });
+
   it('stops parsing JSON held in strings four levels down and prints a marker, never the text', () => {
     let doc: unknown = { password: 'hunter2' };
     for (let level = 0; level < 4; level += 1) doc = { s: JSON.stringify(doc) };
@@ -1033,6 +1357,51 @@ describe('printing a value never throws and stays bounded', () => {
       });
     }
   }
+
+  it('stops reading a graph of shared references after a fixed number of entries per value', () => {
+    let reads = 0;
+    const leaf = Object.defineProperty({}, 'v', {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return 1;
+      },
+    });
+    // 40 keys per level, all the same object: 40^3 = 64,000 leaves (128,000 reads) without a budget.
+    let node: object = leaf;
+    for (let level = 0; level < 3; level += 1) {
+      const shared = node;
+      node = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`k${i}`, shared]));
+    }
+    const { log, parsed } = logger();
+    log.info({ graph: node });
+    expect(reads).toBeLessThan(1_000);
+    expect(parsed()[0].graph as string).toMatch(/^\{"k0":\{"k0":\{"k0":\{"v":1\}/);
+  });
+
+  it('reads 1000 entries of one value, all levels together, and no more', () => {
+    const value = (lastSize: number) => {
+      const reads = { count: 0 };
+      const last = Object.defineProperty(
+        Object.fromEntries(Array.from({ length: lastSize - 1 }, (_, i) => [`k${i}`, 0])),
+        'probe',
+        {
+          enumerable: true,
+          get: () => {
+            reads.count += 1;
+            return 0;
+          },
+        },
+      );
+      return { list: [...Array.from({ length: 9 }, () => new Array<number>(100).fill(0)), last], reads };
+    };
+    const exact = value(90); // 10 + 9 * 100 + 90 = 1000 entries
+    const over = value(91); // 1001
+    const { log } = logger();
+    log.info({ exact: exact.list, over: over.list });
+    expect(exact.reads.count).toBeGreaterThan(0);
+    expect(over.reads.count).toBe(0);
+  });
 
   it('prints an object it cannot read as [unserializable], per value', () => {
     const { log, target, uninstall, parsed, msgs } = bridged();
