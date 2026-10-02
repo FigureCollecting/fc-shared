@@ -941,6 +941,7 @@ describe('URLs in log output lose their query, fragment and userinfo (plan-v2 pr
     ['an internationalised host with a query', 'bücher.example?sig=SECRET', 'bücher.example'],
     ['a single-label host with key=value pairs in a fragment', 'scraper#state=SECRET', 'scraper'],
     ['a protocol-relative URL inside text', 'see //cdn.example/a?sig=SECRET now', 'see //cdn.example/a now'],
+    ['a protocol-relative URL to a single-label host inside text', 'call //scraper:3050/x?sig=SECRET now', 'call //scraper:3050/x now'],
     // Fastify's default not-found message: the method and the URL joined by a colon.
     ['a method and target joined by a colon', 'Route GET:/nothere?sig=SECRET not found', 'Route GET:/nothere not found'],
     ['a colon-joined target with a fragment, then a query', 'Route GET:/x#SECRET?y not found', 'Route GET:/x not found'],
@@ -1519,6 +1520,123 @@ describe("an Error's message is printed by the one policy wherever it appears", 
     expect(lines[0]).not.toContain('hunter1');
     const head = errorHead('see docs', 'Error: see docs');
     expect(start(parsed()[0].url, head.length)).toBe(head);
+  });
+
+  it('does so under a URL-named key at any depth, and nowhere else', () => {
+    const { log, lines, parsed } = logger();
+    log.info({ data: { url: new Error('see docs?sig=hunter31') }, page: { links: [new Error('next page?cursor=hunter32')] } });
+    log.info({ cause: new Error('why? because') });
+    expect(lines.join('\n')).not.toMatch(/hunter/);
+    const [nested, plain] = parsed();
+    const data = `{"url":${errorHead('see docs', 'Error: see docs')}`;
+    expect(start(nested.data, data.length)).toBe(data);
+    const page = `{"links":[${errorHead('next page', 'Error: next page')}`;
+    expect(start(nested.page, page.length)).toBe(page);
+    const cause = errorHead('why? because', 'Error: why? because');
+    expect(start(plain.cause, cause.length)).toBe(cause);
+  });
+
+  it("rewrites a stack header that is not the one V8 or node wrote for the error's name, code and message", () => {
+    /** An Error whose message changed after V8 wrote its stack. */
+    const stale = (old: string, message: string): Error => {
+      const error = new Error(old);
+      void error.stack;
+      error.message = message;
+      return error;
+    };
+    const frame = '\n    at f (/app/a.js:1:1)';
+    const coded = (code: unknown): Error => Object.assign(new Error('m'), { code, stack: `Error [${String(code)}]: m${frame}` });
+    const errors = {
+      // The new message follows ': ' inside the old one, so the old header ends with ': ' and the new message.
+      url: stale('/login?token=hunter20: timeout', 'timeout'),
+      header: stale('Cookie: sid=hunter21: timeout', 'timeout'),
+      middle: stale('Cookie: sid=hunter22: retry: later', 'retry'),
+      // Node writes 'name [CODE]: message' for its own errors, whose code is an upper-case identifier.
+      custom: Object.assign(new Error('m'), { stack: `Error [/x?token=hunter23]: m${frame}` }),
+      notCode: coded('/x?sig=HUNTER24'),
+      tail: coded('ERR_X?sig=hunter25'),
+      symbol: Object.assign(new Error('m'), { code: Symbol('ERR_X') }),
+      // A header that starts with the one node writes, but goes on: the message changed after the stack was written.
+      truncated: Object.assign(new RangeError('m'), { code: 'ERR_X', stack: `RangeError [ERR_X]: m?sig=hunter26${frame}` }),
+      // A stack of frames alone.
+      headless: Object.assign(new Error('m'), { stack: frame.slice(1) }),
+    };
+    const { log, lines, parsed } = logger();
+    log.info(errors);
+    expect(lines.join('\n')).not.toMatch(/hunter/i);
+    const [line] = parsed();
+    const timeout = errorHead('timeout', 'Error: timeout');
+    expect([start(line.url, timeout.length), start(line.header, timeout.length)]).toEqual([timeout, timeout]);
+    const retry = errorHead('retry', 'Error: retry');
+    expect(start(line.middle, retry.length)).toBe(retry);
+    const rewritten = JSON.stringify({ name: 'Error', message: 'm', stack: `Error: m${frame}` });
+    expect([line.custom, line.not_code, line.tail, line.headless]).toEqual([rewritten, rewritten, rewritten, rewritten]);
+    expect(line.truncated).toBe(JSON.stringify({ name: 'RangeError', message: 'm', stack: `RangeError: m${frame}` }));
+    const symbol = errorHead('m', 'Error: m');
+    expect(start(line.symbol, symbol.length)).toBe(symbol);
+  });
+
+  it("takes a message's own frame-shaped lines as the message, and keeps only the frames after the header", () => {
+    const stale = (old: string): Error => {
+      const error = new Error(old);
+      void error.stack;
+      error.message = 'x';
+      return error;
+    };
+    const appended = new Error('outer');
+    appended.stack = `${appended.stack}\nCaused by: Error: /x?token=hunter28\n    at inner (/app/b.js:1:1)`;
+    const errors = {
+      fresh: new Error('/api?q=1\n    at hunter25'),
+      // An error with a code that V8 wrote no code into the header for (node's fs errors: 'Error: ENOENT: ...').
+      uncoded: Object.assign(new Error('/api?q=1\n    at hunter33'), { code: 'ENOENT' }),
+      // A stale header: its frames are the lines after its last line that is not one, whatever the old message held.
+      unindented: stale('/api?q=1\nat hunter26'),
+      middle: stale('/api?q=1\n    at x\ntail hunter27'),
+      appended,
+    };
+    const { log, lines, parsed } = logger();
+    log.info(errors);
+    expect(lines.join('\n')).not.toMatch(/hunter/);
+    const [line] = parsed();
+    const fresh = errorHead('/api', 'Error: /api');
+    expect([start(line.fresh, fresh.length), start(line.uncoded, fresh.length)]).toEqual([fresh, fresh]);
+    const x = errorHead('x', 'Error: x');
+    expect([start(line.unindented, x.length), start(line.middle, x.length)]).toEqual([x, x]);
+    expect(line.appended).toBe(JSON.stringify({ name: 'Error', message: 'outer', stack: 'Error: outer\n    at inner (/app/b.js:1:1)' }));
+  });
+
+  it('writes the header V8 writes for an empty or missing name', () => {
+    const { log, lines, parsed } = logger();
+    // V8 writes the message alone for an empty name (node does; under jest the stack says 'Error: ...'), and
+    // 'Error' for a missing one. Either way the header is written again from the name.
+    log.info({
+      unnamed: Object.assign(new Error('Cookie: sid=hunter29'), { name: '' }),
+      nameless: Object.assign(new Error('Cookie: sid=hunter30'), { name: undefined }),
+    });
+    expect(lines.join('\n')).not.toMatch(/hunter/);
+    const [line] = parsed();
+    const unnamed = errorHead('Cookie: [REDACTED]', 'Cookie: [REDACTED]', '');
+    expect(start(line.unnamed, unnamed.length)).toBe(unnamed);
+    const nameless = JSON.stringify({ message: 'Cookie: [REDACTED]', stack: 'Error: Cookie: [REDACTED]\n    at ' }).slice(0, -2);
+    expect(start(line.nameless, nameless.length)).toBe(nameless);
+  });
+
+  it("reads an Error's message once per printed value: the stack's copy shares its budget and its printing", () => {
+    // Spaced, so the parse of the message is told apart from the logger's own compact round trip.
+    const message = JSON.stringify(Array.from({ length: 30 }, (_, n) => ({ n })), null, 1);
+    const { log } = logger();
+    const parse = jest.spyOn(JSON, 'parse');
+    const counts: number[] = [];
+    try {
+      log.info({ one: new Error(message) });
+      counts.push(parse.mock.calls.filter(([text]) => text === message).length);
+      // 100 Errors, 60 entries each: read once, reused until too few entries are left, then read once more, cut short.
+      log.info({ many: Array.from({ length: 100 }, () => new Error(message)) });
+      counts.push(parse.mock.calls.filter(([text]) => text === message).length - counts[0]);
+    } finally {
+      parse.mockRestore();
+    }
+    expect(counts).toEqual([1, 2]);
   });
 });
 
