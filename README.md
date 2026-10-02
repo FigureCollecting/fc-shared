@@ -124,13 +124,24 @@ message is printed by it wherever it appears: as `err.message`, in `msg`
 (`console.error(err)`, `log.info('failed', err)`) and in its stack. A key that
 names a secret (`password`, `token`, `cookie` ...) has its value masked, also
 when printing changes the key (`/login?token` prints as `/login`). The query
-and form keys `sig`, `signature` and `code_verifier`, as a word of the key
-(`X-Amz-Signature`, `urlSig`, `codeVerifier`), name a secret too, whatever key
-pattern a service gives: as an object key at any depth, a form key and the
-name of a header line. `code` (an OAuth code) names one only as a form key: as
-an object key it is the log shape's own field, an error's code and a word of
-`statusCode`, so a parsed query's `code` (`{ q: req.query }`) prints. `call` is
-also cut at its first `?` or `#`.
+and form keys `code`, `code_verifier`, `sig` and `signature` are sensitive:
+their values are masked as `token`'s and `password`'s are, whatever key
+pattern a service gives, within these bounds. `code_verifier`, `sig` and
+`signature`, as a word of the key (`X-Amz-Signature`, `urlSig`,
+`codeVerifier`), mask their value as an object key at any depth, a form key
+and the name of a header line. `code` (an OAuth code) masks its value as a
+form key, as a word of the key (`device_code`). As an object key at any depth
+(a parsed query `{ q: req.query }`, axios `config.params`, a JSON body) the
+OAuth code keys `code`, `auth_code`, `authorization_code`, `device_code` and
+`user_code` (`authCode` and `Code` too) mask a string or an array, whatever it
+reads as: a reset code `493817` cannot be told from an error code `ENOENT`, so
+an error code under `code` in a plain object is masked too (an Error prints as
+`{name, message, stack}`, never through its `code` key). A number, a boolean,
+null and an object under them print, and so does any other key with the word
+`code` (`statusCode`, `jan_code`, `error_code`). The log shape's own `code`
+field, a top-level key of the call (a Connect code name or an HTTP status), is
+never masked, so a query spread into a call (`log.info({ ...req.query })`)
+prints its `code`. `call` is also cut at its first `?` or `#`.
 
 - a `scheme://` or `//` URL anywhere in the text loses its userinfo, and its
   query and fragment up to the next whitespace (a quote does not end it; a
@@ -181,11 +192,12 @@ also cut at its first `?` or `#`.
   `[unserializable]`; a log call never throws for what it was given.
 
 Other free text is masked only by the secret-shape patterns (Bearer, JWT,
-...): a secret in prose, JSON or a form embedded in a longer sentence (text
-that holds `key=value` pairs is read as a form only when it is one as a whole,
-so `retry with code=...&sig=...` prints), and a path in the middle of a
-sentence with its query (`see /docs?page=2`, `fetch /x?sig=... failed`), are
-left as written.
+...): a secret in prose, JSON or a form embedded in a longer sentence, and a
+path in the middle of a sentence with its query (`see /docs?page=2`,
+`fetch /x?sig=... failed`), are left as written. Free text is never searched
+for a form: text that holds `key=value` pairs is read as one only when it is a
+form as a whole, so form-like text with no `?` before it inside a longer
+sentence (`retry with code=...&sig=...`) prints as written.
 
 A child logger given an empty or unknown level, or one that is not a string,
 keeps its parent's level and never throws (Fastify 5 passes `{ level: '' }`

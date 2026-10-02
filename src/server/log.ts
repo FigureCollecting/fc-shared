@@ -177,8 +177,13 @@ type Scalar = string | number | boolean | null;
  * gives.
  */
 const QUERY_SECRET_KEY = /(?:^|_)(?:sig|signature|code_verifier)(?:_|$)/;
-/** In a form an OAuth code too; as an object key, code is the log shape's own field and an error's code. */
+/** In a form an OAuth code too, as a word of the key (code, device_code). */
 const FORM_SECRET_KEY = /(?:^|_)code(?:_|$)/;
+/**
+ * An object key that holds an OAuth code (RFC 6749 code, RFC 8628 device_code and user_code, auth_code), as the
+ * snake_case key. Only these: code as a word of a key is also statusCode, jan_code and error_code.
+ */
+const OAUTH_CODE_KEY = /^(?:auth_|authorization_|device_|user_)?code$/;
 /** A key that can hold one of those words: only it is snake-cased (snake-casing every key doubled an 8 KB form's cost). */
 const SECRET_WORD_HINT = /sig|code/i;
 
@@ -189,6 +194,27 @@ function isSensitive(key: string, redact: RedactOptions, form = false): boolean 
   if (!SECRET_WORD_HINT.test(key)) return false;
   const snake = toSnakeCase(key);
   return QUERY_SECRET_KEY.test(snake) || (form && FORM_SECRET_KEY.test(snake));
+}
+
+/**
+ * A value under an OAuth code key (OAUTH_CODE_KEY) as a parsed query or body holds one: any string (a reset code
+ * '493817' reads as an error code 'ENOENT' does), or an array (a repeated query key). A number, a boolean, null and
+ * an object print as any value does (a gRPC status's code); the log shape's own code field is never read here.
+ */
+function isSecretCode(key: string, value: unknown): boolean {
+  if (!OAUTH_CODE_KEY.test(toSnakeCase(key))) return false;
+  if (typeof value === 'string') return true;
+  try {
+    return Array.isArray(value);
+  } catch {
+    // A revoked Proxy: it prints as '[unserializable]', as any value the logger cannot read.
+    return false;
+  }
+}
+
+/** A key whose value is masked, unread: a sensitive key, or an OAuth code key holding a code. */
+function masks(key: string, value: unknown, redact: RedactOptions): boolean {
+  return isSensitive(key, redact) || isSecretCode(key, value);
 }
 
 function placeholder(redact: RedactOptions): string {
@@ -552,7 +578,8 @@ function rekeyed(value: object, redact: RedactOptions): object {
   if (printed.every((key, index) => key === keys[index])) return value;
   const out: Record<string, unknown> = {};
   keys.forEach((key, index) => {
-    out[printed[index]] = isSensitive(key, redact) ? placeholder(redact) : (value as Record<string, unknown>)[key];
+    const entry = (value as Record<string, unknown>)[key];
+    out[printed[index]] = masks(key, entry, redact) ? placeholder(redact) : entry;
   });
   return out;
 }
@@ -587,8 +614,8 @@ function shapeValues(
   const inUrl = new WeakSet<object>();
   return function shape(this: unknown, key: string, value: unknown): unknown {
     const holder = this as Record<string, unknown>;
-    // A key that names a secret (sig and the other query keys included) has its value masked, unread.
-    if (isSensitive(key, redact)) return placeholder(redact);
+    // A key that names a secret (sig and the other query keys included), or an OAuth code key's code, is masked.
+    if (masks(key, value, redact)) return placeholder(redact);
     // Under a URL-named key every value is a URL value, so a URL root makes them all one.
     const urlValued = rootInUrl || isUrlKey(key) || inUrl.has(holder);
     if (typeof value === 'string') return redactText(value, redact, nesting, urlValued, budget);
@@ -683,7 +710,7 @@ function buildEntry(
     if (OWNED.has(key)) continue;
     if (CALLER_RESERVED.has(key)) reserved[key] = value;
     // The key as given decides too: printing may drop the word that names a secret ('/login?token').
-    else extras[key] = isSensitive(rawKey, core.redact) ? placeholder(core.redact) : flatValue(key, value, core.redact);
+    else extras[key] = masks(rawKey, value, core.redact) ? placeholder(core.redact) : flatValue(key, value, core.redact);
   }
 
   const entry: Record<string, unknown> = {
