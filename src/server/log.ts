@@ -145,11 +145,14 @@ function parseLevel(value: unknown): LevelSetting | undefined {
   return normalised !== undefined && Object.hasOwn(SEVERITY, normalised) ? (normalised as LevelSetting) : undefined;
 }
 
-/** `itemId` -> `item_id`, `HTTP-Status` -> `http_status`; never empty, never leading digit. */
+/**
+ * `itemId` -> `item_id`, `HTTP-Status` -> `http_status`; never empty, never leading digit. Linear in the key's
+ * length (a key can be as long as a request body): no rule rescans a run of capitals.
+ */
 export function toSnakeCase(key: string): string {
   const snake = key
     .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+    .replace(/([A-Z])(?=[A-Z][a-z])/g, '$1_')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
