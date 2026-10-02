@@ -416,6 +416,24 @@ describe('server log levels, identity and bindings', () => {
     expect(parsed()[0].req_id).toBe('req-1');
   });
 
+  it('a child given a level that is not a string keeps its parent level and never throws', () => {
+    const { log, parsed } = logger({ level: 'warn' });
+    // Untyped JavaScript, or a caller passing pino's numeric levels.
+    interface Untyped {
+      child(bindings: Record<string, unknown>, options?: { level?: unknown }): Logger;
+    }
+    const untyped: Untyped = log;
+    const numeric = untyped.child({}, { level: 30 });
+    const object = untyped.child({}, { level: {} });
+    const named = untyped.child({}, { level: { toString: () => 'debug' } });
+    numeric.warn('numeric');
+    numeric.info('hidden');
+    object.warn('object');
+    named.info('hidden');
+    expect([numeric.level, object.level, named.level]).toEqual(['warn', 'warn', 'warn']);
+    expect(parsed().map((line) => line.msg)).toEqual(['numeric', 'object']);
+  });
+
   it('reads a LOG_LEVEL that names an Object property (constructor) as unknown', () => {
     const junk = logger({ env: { LOG_LEVEL: 'constructor' } });
     junk.log.debug('hidden');
