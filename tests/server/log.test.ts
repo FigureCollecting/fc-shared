@@ -1463,6 +1463,15 @@ describe("an Error's message is printed by the one policy wherever it appears", 
     expect(msgs()).toEqual(['TypeError: /api/lookup']);
   });
 
+  it('under the header V8 writes for an empty or missing name, or an empty message, in console.error(err)', () => {
+    const { target, uninstall, msgs } = bridged();
+    target.error(Object.assign(new Error('/api/lookup?token=hunter36'), { name: '' }));
+    target.error(Object.assign(new Error('m'), { name: undefined }));
+    target.error(new Error(''));
+    uninstall();
+    expect(msgs()).toEqual(['/api/lookup', 'Error: m', 'Error']);
+  });
+
   it('in the stack of an Error printed as an object: a field, nested, and under %s, %o, %O and %j', () => {
     const { log, target, uninstall, lines, parsed, msgs } = bridged();
     log.info({ cause: new Error(JSON_MESSAGE) });
@@ -1724,6 +1733,17 @@ describe('a form-encoded body (key=value&key=value) has each sensitive value mas
     expect(custom.parsed()[0].body).toBe('usuario=u&contrase%c3%b1a=[REDACTED]');
   });
 
+  it("reads a '+' in a key as a space, as a server does, and an escaped '+' as a '+'", () => {
+    const { log, lines, parsed } = logger({ redact: { sensitiveKeyPattern: /api key/i } });
+    log.info({ plus: 'api+key=hunter70&x=1', escaped: 'api%20key=hunter71&x=1', literal: 'api%2Bkey=visible&x=1' });
+    expect(lines.join('\n')).not.toMatch(/hunter/);
+    expect(parsed()[0]).toMatchObject({
+      plus: 'api+key=[REDACTED]&x=1',
+      escaped: 'api%20key=[REDACTED]&x=1',
+      literal: 'api%2Bkey=visible&x=1',
+    });
+  });
+
   it('reads 8 KB of keys that do not decode without decodeURIComponent throwing', () => {
     // decodeURIComponent throws for a bare '%' and for an escape that is not UTF-8. 8 KB is what is left of a value
     // after the 8,192-character cap; Fastify logs a request's URL on every request.
@@ -1785,6 +1805,58 @@ describe('a form-encoded body (key=value&key=value) has each sensitive value mas
     uninstall();
     expect(lines.join('\n')).not.toMatch(/[A-Z]+-SECRET/);
     expect(parsed()[0].data).toBe('grant_type=password&username=ross&password=[REDACTED]&client_secret=[REDACTED]');
+  });
+});
+
+describe('the query and form keys code, code_verifier, sig and signature are sensitive', () => {
+  it('in a form-encoded value, as a word of the key, whatever key pattern the service gives', () => {
+    const { log, lines, parsed } = logger();
+    log.info({
+      oauth: 'code=hunter50&state=s&code_verifier=hunter51',
+      signed: 'X-Amz-Date=1&X-Amz-Signature=hunter52&sig=hunter53&signature=hunter54',
+      words: 'urlSig=hunter55&device_code=hunter56&codeVerifier=hunter57&%73ig=hunter58',
+      unsigned: 'signal=1&design=2&sigma=3&barcode=4',
+    });
+    const custom = logger({ redact: { sensitiveKeyPattern: /dpop/i } });
+    custom.log.info({ query: 'sig=hunter59&page=2&dpop=hunter60' });
+    expect([...lines, ...custom.lines].join('\n')).not.toMatch(/hunter/);
+    expect(parsed()[0]).toMatchObject({
+      oauth: 'code=[REDACTED]&state=s&code_verifier=[REDACTED]',
+      signed: 'X-Amz-Date=1&X-Amz-Signature=[REDACTED]&sig=[REDACTED]&signature=[REDACTED]',
+      words: 'urlSig=[REDACTED]&device_code=[REDACTED]&codeVerifier=[REDACTED]&%73ig=[REDACTED]',
+      unsigned: 'signal=1&design=2&sigma=3&barcode=4',
+    });
+    expect(custom.parsed()[0].query).toBe('sig=[REDACTED]&page=2&dpop=[REDACTED]');
+  });
+
+  it('sig, signature and code_verifier also as an object key at any depth and a header name; code only in a form', () => {
+    const { log, lines, parsed } = logger();
+    log.info({
+      q: { sig: 'hunter61', page: '2' },
+      params: { 'X-Amz-Signature': 'hunter62', codeVerifier: 'hunter63' },
+      signature: 'hunter64',
+      headers: 'Signature: sig1=:hunter65:',
+    });
+    // As an object key, code is the log shape's own field and an error's code, so a parsed query's code prints.
+    log.info({ error: { code: 'ENOENT' }, query: { code: 'oauth-code' }, signal: 'kept', design: 'kept', sigma: 'kept' });
+    // A form inside a longer text is not read as one.
+    log.info({ prose: 'retry with code=visible&sig=visible' });
+    expect(lines.join('\n')).not.toMatch(/hunter/);
+    const [signed, coded, prose] = parsed();
+    expect(signed).toMatchObject({
+      q: JSON.stringify({ sig: '[REDACTED]', page: '2' }),
+      params: JSON.stringify({ 'X-Amz-Signature': '[REDACTED]', codeVerifier: '[REDACTED]' }),
+      signature: '[REDACTED]',
+      headers: 'Signature: [REDACTED]',
+    });
+    expect(coded).toMatchObject({
+      error: JSON.stringify({ code: 'ENOENT' }),
+      query: JSON.stringify({ code: 'oauth-code' }),
+      signal: 'kept',
+      design: 'kept',
+      sigma: 'kept',
+    });
+    expect(prose.prose).toBe('retry with code=visible&sig=visible');
   });
 });
 
