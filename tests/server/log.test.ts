@@ -1872,6 +1872,35 @@ describe('the query and form keys code, code_verifier, sig and signature are sen
     });
     expect(prose.prose).toBe('retry with code=visible&sig=visible');
   });
+
+  it('reads a long key that holds sig or code at about the cost of a plain key, on every path a key takes', () => {
+    // A key is snake-cased to find those words. A rule that rescans a run of capitals from each start costs time that
+    // grows with the square of the run: 80 to 120 times the plain cost here (16,000 characters), 25 times for 8 KB
+    // form keys. The costs are compared with each other, the fastest of three runs each, never with a clock bound.
+    const { log, lines } = logger();
+    const paths: Array<(key: string) => void> = [
+      (key) => log.info({ [key]: 1 }, 'merged'),
+      (key) => log.child({ [key]: 1 }).info('child'),
+      (key) => log.info({ body: { [key]: 1 } }),
+      (key) => log.info({ rawHeaders: [key, 'v'] }),
+      (key) => log.info({ body: Array.from({ length: 20 }, (_, index) => `${key.slice(0, 8_000)}${index}=1`) }),
+    ];
+    const cost = (path: (key: string) => void, key: string): number => {
+      let fastest = Infinity;
+      for (let run = 0; run < 3; run += 1) {
+        const started = performance.now();
+        path(`${key}${run}`);
+        fastest = Math.min(fastest, performance.now() - started);
+      }
+      return fastest;
+    };
+    const ratios = paths.map((path) => {
+      const plain = cost(path, 'a'.repeat(16_000));
+      return Math.max(cost(path, `CODE${'A'.repeat(16_000)}`), cost(path, `SIG${'A'.repeat(16_000)}`)) / plain;
+    });
+    expect(lines).toHaveLength(paths.length * 9);
+    expect(Math.max(...ratios)).toBeLessThan(10);
+  });
 });
 
 describe('an object that hides itself from util.inspect prints as its class name', () => {
