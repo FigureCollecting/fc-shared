@@ -1456,6 +1456,13 @@ describe("an Error's message is printed by the one policy wherever it appears", 
     expect(lines.join('\n')).not.toMatch(/hunter/);
   });
 
+  it('under its own name in console.error(err)', () => {
+    const { target, uninstall, msgs } = bridged();
+    target.error(new TypeError('/api/lookup?token=hunter34'));
+    uninstall();
+    expect(msgs()).toEqual(['TypeError: /api/lookup']);
+  });
+
   it('in the stack of an Error printed as an object: a field, nested, and under %s, %o, %O and %j', () => {
     const { log, target, uninstall, lines, parsed, msgs } = bridged();
     log.info({ cause: new Error(JSON_MESSAGE) });
