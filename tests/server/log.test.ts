@@ -2062,11 +2062,12 @@ describe('the query and form keys code, code_verifier, sig and signature are sen
       return Math.max(cost(path, `CODE${'A'.repeat(16_000)}`), cost(path, `SIG${'A'.repeat(16_000)}`)) / plain;
     });
     // A rule that rescans a lower-case run slows the plain key as much, which that ratio cannot see; so the plain key's
-    // own growth is bounded too. Sixteen times as long, it costs about 5 times as much; over 100 times at the square.
-    const growth = paths.map((path) => cost(path, 'a'.repeat(32_000)) / cost(path, 'a'.repeat(2_000)));
+    // own growth is bounded too, below the 8,192 characters a printed key is cut to. From 500 to 8,000 characters it
+    // costs about 14 times as much here, about 140 times when a rule rescans a lower-case run.
+    const growth = paths.map((path) => cost(path, 'a'.repeat(8_000)) / cost(path, 'a'.repeat(500)));
     expect(lines).toHaveLength(paths.length * 15);
     expect(Math.max(...ratios)).toBeLessThan(10);
-    expect(Math.max(...growth)).toBeLessThan(25);
+    expect(Math.max(...growth)).toBeLessThan(40);
   });
 });
 
