@@ -187,12 +187,15 @@ const QUERY_SECRET_KEY = /(?:^|_)(?:sig|signature|code_verifier)(?:_|$)/;
 /** In a form an OAuth code too, as a word of the key (code, device_code). */
 const FORM_SECRET_KEY = /(?:^|_)code(?:_|$)/;
 /**
- * An object key that holds an OAuth code (RFC 6749 code, RFC 8628 device_code and user_code, auth_code), as the
- * snake_case key. Only these: code as a word of a key is also statusCode, jan_code and error_code.
+ * An object key that holds an OAuth or one-time code (RFC 6749 code, RFC 8628 device_code and user_code, auth_code,
+ * oauth_code, verification_code, reset_code, mfa_code, confirmation_code), as the snake_case key, also with an index
+ * ('code[0]' is code_0). Only these: code as a word of a key is also statusCode, jan_code and error_code.
  */
-const OAUTH_CODE_KEY = /^(?:auth_|authorization_|device_|user_)?code$/;
+const OAUTH_CODE_KEY = /^(?:auth_|authorization_|device_|user_|oauth_|verification_|reset_|mfa_|confirmation_)?code(?:_[0-9]+)?$/;
 /** A key that can hold one of those words: only it is snake-cased (snake-casing every key doubled an 8 KB form's cost). */
 const SECRET_WORD_HINT = /sig|code/i;
+/** The same for an OAuth code key alone: a snake_case key holds 'code' only when the key does, in any case. */
+const CODE_WORD = /code/i;
 
 function isSensitive(key: string, redact: RedactOptions, form = false): boolean {
   const pattern = redact.sensitiveKeyPattern ?? DEFAULT_SENSITIVE_KEY_PATTERN;
@@ -204,15 +207,16 @@ function isSensitive(key: string, redact: RedactOptions, form = false): boolean 
 }
 
 /**
- * A value under an OAuth code key (OAUTH_CODE_KEY) as a parsed query or body holds one: any string (a reset code
- * '493817' reads as an error code 'ENOENT' does), or an array (a repeated query key). A number, a boolean, null and
- * an object print as any value does (a gRPC status's code); the log shape's own code field is never read here.
+ * A value under an OAuth code key (OAUTH_CODE_KEY) as a parsed query or body holds one: any string, boxed or not (a
+ * reset code '493817' reads as an error code 'ENOENT' does), or an array (a repeated query key). A number, a boolean,
+ * null and another object print as any value does (a gRPC status's code); the log shape's own code field is never
+ * read here (SHAPE_CODE decides it).
  */
 function isSecretCode(key: string, value: unknown): boolean {
-  if (!OAUTH_CODE_KEY.test(toSnakeCase(key))) return false;
+  if (!CODE_WORD.test(key) || !OAUTH_CODE_KEY.test(toSnakeCase(key))) return false;
   if (typeof value === 'string') return true;
   try {
-    return Array.isArray(value);
+    return Array.isArray(value) || value instanceof String;
   } catch {
     // A revoked Proxy: it prints as '[unserializable]', as any value the logger cannot read.
     return false;
@@ -235,7 +239,8 @@ function safeString(value: string, redact: RedactOptions): string {
 /** Flatten one extra field to a scalar the schema accepts. */
 function flatValue(key: string, value: unknown, redact: RedactOptions): Scalar {
   if (value === null) return null;
-  if (isSensitive(key, redact)) return placeholder(redact);
+  // The key as printed decides too: 'authCode?x=1' prints as auth_code.
+  if (masks(key, value, redact)) return placeholder(redact);
   switch (typeof value) {
     case 'string':
     case 'object':

@@ -132,14 +132,18 @@ pattern a service gives, within these bounds. `code_verifier`, `sig` and
 and the name of a header line. `code` (an OAuth code) masks its value as a
 form key, as a word of the key (`device_code`). As an object key at any depth
 (a parsed query `{ q: req.query }`, axios `config.params`, a JSON body) the
-OAuth code keys `code`, `auth_code`, `authorization_code`, `device_code` and
-`user_code` (`authCode` and `Code` too) mask a string or an array, whatever it
-reads as: a reset code `493817` cannot be told from an error code `ENOENT`, so
-an error code under `code` in a plain object is masked too (an Error prints as
-`{name, message, stack}`, never through its `code` key). A number, a boolean,
-null and an object under them print, and so does any other key with the word
-`code` (`statusCode`, `jan_code`, `error_code`). The log shape's own `code`
-field (a top-level `code` or `Code` of the call or of a child's bindings)
+OAuth and one-time code keys `code`, `auth_code`, `authorization_code`,
+`device_code`, `user_code`, `oauth_code`, `verification_code`, `reset_code`,
+`mfa_code` and `confirmation_code` (`authCode` and `Code` too, and with an
+index: `code[0]`), also as a top-level key that prints as one
+(`authCode?x=1`), mask a string (a `String` object too) or an array,
+whatever it reads as: a reset code `493817` cannot be told from an error code
+`ENOENT`, so an error code under `code` in a plain object is masked too (an
+Error prints as `{name, message, stack}`, never through its `code` key). A
+number, a boolean, null and any other object under them print, and so does
+any other key with the word `code` (`statusCode`, `jan_code`, `error_code`).
+The log shape's own `code` field (a top-level `code` or `Code` of the call or
+of a child's bindings)
 prints a string only when it is a code the library writes: `ok`, `error`, one
 of the 16 Connect code names, or a three-digit status from 100 to 599. Any
 other string prints as the placeholder, so a query handed to the call as its
@@ -200,8 +204,11 @@ Other free text is masked only by the secret-shape patterns (Bearer, JWT,
 path in the middle of a sentence with its query (`see /docs?page=2`,
 `fetch /x?sig=... failed`), are left as written. Free text is never searched
 for a form: text that holds `key=value` pairs is read as one only when it is a
-form as a whole, so form-like text with no `?` before it inside a longer
-sentence (`retry with code=...&sig=...`) prints as written.
+form as a whole, so form-like text inside a longer sentence, with or without
+a `?` before it (`retry with code=...&sig=...`, `callback /cb?code=...&state=x`),
+prints as written; a query is cut only where the rules above cut it (a
+value that starts with a URL or path, a `scheme://` URL, a request target
+after an HTTP method).
 
 A child logger given an empty or unknown level, or one that is not a string,
 keeps its parent's level and never throws (Fastify 5 passes `{ level: '' }`
