@@ -539,6 +539,9 @@ describe('server log levels, identity and bindings', () => {
     expect(toSnakeCase('with-dash.and space')).toBe('with_dash_and_space');
     expect(toSnakeCase('9lives')).toBe('f_9lives');
     expect(toSnakeCase('__')).toBe('field');
+    // A capital run ends at a capital followed by a lower-case letter, never by a digit.
+    expect(toSnakeCase('HTTP2Server')).toBe('http2_server');
+    expect(toSnakeCase('ABC1')).toBe('abc1');
   });
 });
 
@@ -1899,8 +1902,8 @@ describe('the query and form keys code, code_verifier, sig and signature are sen
     });
     // A parsed query's code is masked.
     log.info({ query: { code: 'oauth-code' }, signal: 'kept', design: 'kept', sigma: 'kept' });
-    // A form inside a longer text is not read as one.
-    log.info({ prose: 'retry with code=visible&sig=visible' });
+    // A form inside a longer text is not read as one, with or without a ? before it.
+    log.info({ prose: 'retry with code=visible&sig=visible', detail: 'callback /cb?code=visible&state=x' });
     expect(lines.join('\n')).not.toMatch(/hunter/);
     const [signed, coded, prose] = parsed();
     expect(signed).toMatchObject({
@@ -1918,7 +1921,7 @@ describe('the query and form keys code, code_verifier, sig and signature are sen
       design: 'kept',
       sigma: 'kept',
     });
-    expect(prose.prose).toBe('retry with code=visible&sig=visible');
+    expect(prose).toMatchObject({ prose: 'retry with code=visible&sig=visible', detail: 'callback /cb?code=visible&state=x' });
   });
 
   it('an OAuth code key in an object at any depth masks a string or an array; a number, null or an object prints', () => {
@@ -1994,6 +1997,45 @@ describe('the query and form keys code, code_verifier, sig and signature are sen
     expect(reserved.code).toBe('internal');
   });
 
+  it('more OAuth code keys, an indexed key, a boxed string and a top-level key that prints as one mask the code', () => {
+    const { log, lines, parsed } = logger();
+    log.info({
+      q: {
+        oauth_code: 'hunter100',
+        oauthCode: 'hunter101',
+        verification_code: 'hunter102',
+        verificationCode: 'hunter103',
+        reset_code: 'hunter104',
+        mfa_code: 'hunter105',
+        confirmation_code: 'hunter106',
+      },
+      // A repeated query key read into an object with an index (URLSearchParams entries, a form library).
+      indexed: { 'code[0]': 'hunter107', 'code[1]': 'hunter108', 'auth_code[12]': 'hunter109' },
+      boxed: { code: new String('hunter110') },
+    });
+    // A top-level key is read as printed too: 'authCode?x=1' prints as auth_code, 'code?x=1' as the shape's code.
+    log.info({ 'authCode?x=1': 'hunter111', 'code?x=1': 'hunter112' });
+    // Not OAuth code keys: another prefix, an index that is not a number.
+    log.info({ q: { promo_code: 'shown-0', zip_code: '32501', 'code[a]': 'shown-1', xcode: 'shown-2' } });
+    expect(lines.join('\n')).not.toMatch(/hunter/);
+    const [nested, top, shown] = parsed();
+    expect(nested).toMatchObject({
+      q: JSON.stringify({
+        oauth_code: '[REDACTED]',
+        oauthCode: '[REDACTED]',
+        verification_code: '[REDACTED]',
+        verificationCode: '[REDACTED]',
+        reset_code: '[REDACTED]',
+        mfa_code: '[REDACTED]',
+        confirmation_code: '[REDACTED]',
+      }),
+      indexed: JSON.stringify({ 'code[0]': '[REDACTED]', 'code[1]': '[REDACTED]', 'auth_code[12]': '[REDACTED]' }),
+      boxed: JSON.stringify({ code: '[REDACTED]' }),
+    });
+    expect(top).toMatchObject({ auth_code: '[REDACTED]', code: '[REDACTED]' });
+    expect(shown.q).toBe(JSON.stringify({ promo_code: 'shown-0', zip_code: '32501', 'code[a]': 'shown-1', xcode: 'shown-2' }));
+  });
+
   it('reads a long key that holds sig or code at about the cost of a plain key, on every path a key takes', () => {
     // A key is snake-cased to find those words. A rule that rescans a run of capitals from each start costs time that
     // grows with the square of the run: 80 to 120 times the plain cost here (16,000 characters), 25 times for 8 KB
@@ -2019,8 +2061,12 @@ describe('the query and form keys code, code_verifier, sig and signature are sen
       const plain = cost(path, 'a'.repeat(16_000));
       return Math.max(cost(path, `CODE${'A'.repeat(16_000)}`), cost(path, `SIG${'A'.repeat(16_000)}`)) / plain;
     });
-    expect(lines).toHaveLength(paths.length * 9);
+    // A rule that rescans a lower-case run slows the plain key as much, which that ratio cannot see; so the plain key's
+    // own growth is bounded too. Sixteen times as long, it costs about 5 times as much; over 100 times at the square.
+    const growth = paths.map((path) => cost(path, 'a'.repeat(32_000)) / cost(path, 'a'.repeat(2_000)));
+    expect(lines).toHaveLength(paths.length * 15);
     expect(Math.max(...ratios)).toBeLessThan(10);
+    expect(Math.max(...growth)).toBeLessThan(25);
   });
 });
 
