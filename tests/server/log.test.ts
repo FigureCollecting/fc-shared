@@ -10,6 +10,7 @@ import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-ho
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { inspect } from 'node:util';
+import { Code, ConnectError } from '@connectrpc/connect';
 import axios, { AxiosError, AxiosHeaders } from 'axios';
 import {
   RESERVED_LOG_KEYS,
@@ -19,6 +20,7 @@ import {
   toSnakeCase,
   type Logger,
 } from '../../src/server/log';
+import { codeName } from '../../src/server/connect';
 import * as sanitize from '../../src/utils/sanitize';
 import { SPAN_ID, TRACE_ID, captureSink, expectValidLine, withRemoteSpan } from './helpers';
 
@@ -278,7 +280,7 @@ describe('server log line shape', () => {
     ]);
   });
 
-  it('prints the reserved call, code, peer, job and event values by the same policy as any value', () => {
+  it('prints the reserved call, peer, job and event values by the same policy as any value; a code not of the shape is masked', () => {
     const { log, lines, parsed } = logger();
     log.info({
       event: 'http.out',
@@ -297,7 +299,7 @@ describe('server log line shape', () => {
     const out = parsed();
     expect(out[0]).toMatchObject({
       call: 'GET https://h.example/x',
-      code: 'https://h.example/x',
+      code: '[REDACTED]',
       peer: 'https://h.example',
       job: '{"token":"[REDACTED]","name":"nightly"}',
     });
@@ -308,6 +310,49 @@ describe('server log line shape', () => {
       job: 'crawl https://h.example/',
     });
     expect(lines.join('\n')).not.toContain('SECRET');
+  });
+
+  it("prints the shape's own code as ok, error, a Connect code name or an HTTP status, and masks any other string", () => {
+    const { log, lines, parsed } = logger();
+    // An OAuth callback's query (Fastify's req.query) handed to the call as its fields, spread, or bound to a child.
+    const query = { code: 'hunter90', state: 's', code_verifier: 'hunter91' };
+    log.info(query, 'fields');
+    log.info({ ...query }, 'spread');
+    log.child({ code: 'hunter92' }).info('child');
+    log.info({ Code: 'hunter93' }, 'capital');
+    // Strings that come near the shape's codes.
+    const near = ['OK', 'Internal', 'okay', 'xok', 'not_found_x', 'errors', '600', '099', '20', '2000', ' 200', '200 OK', 'ok\n', ''];
+    near.forEach((code) => log.info({ code }, 'near'));
+    // What the library writes: codeName for every Connect code and for no error, runJob's error, an HTTP status.
+    const connect = Object.values(Code).filter((value): value is Code => typeof value === 'number');
+    const written = [
+      ...connect.map((code) => codeName(new ConnectError('m', code))),
+      codeName(undefined),
+      'error',
+      '100',
+      '202',
+      '499',
+      '599',
+    ];
+    written.forEach((code) => log.info({ code }, 'written'));
+    // A number prints as a string (a gRPC status, an HTTP status).
+    log.info({ code: 14 }, 'number');
+    const custom = logger({ redact: { placeholder: '***' } });
+    custom.log.info({ code: 'hunter94' });
+    const text = logger({ format: 'text' });
+    text.log.info({ code: 'hunter95' }, 'm');
+
+    expect([...lines, ...custom.lines, ...text.lines].join('\n')).not.toMatch(/hunter/);
+    const out = parsed();
+    out.forEach(expectValidLine);
+    expect(out.slice(0, 4).map((line) => line.code)).toEqual(Array(4).fill('[REDACTED]'));
+    expect(out[0]).toMatchObject({ state: 's', code_verifier: '[REDACTED]' });
+    expect(out.slice(4, 4 + near.length).map((line) => line.code)).toEqual(near.map(() => '[REDACTED]'));
+    expect(connect).toHaveLength(16);
+    expect(out.slice(4 + near.length, -1).map((line) => line.code)).toEqual(written);
+    expect(out[out.length - 1].code).toBe('14');
+    expect(custom.parsed()[0].code).toBe('***');
+    expect(text.lines[0]).toMatch(/ m code=\[REDACTED\]$/);
   });
 
   it('keeps a bridged line an app.console line when its Error cannot be read', () => {
@@ -1945,7 +1990,7 @@ describe('the query and form keys code, code_verifier, sig and signature are sen
       }),
       headers: 'Code: shown-2',
     });
-    // The log shape's own code field is a Connect code name or an HTTP status, never masked.
+    // The log shape's own code field prints a Connect code name.
     expect(reserved.code).toBe('internal');
   });
 
