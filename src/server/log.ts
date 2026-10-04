@@ -21,7 +21,8 @@
  * JSON object or array is key-redacted; objects are key-redacted in their JSON
  * form, a key that names a secret masking its value even when printing
  * changes the key, and a node HTTP message or stream prints as a short summary
- * (see printValue).
+ * (see printValue). The reserved code prints a string only as one of the
+ * shape's codes (SHAPE_CODE), else the placeholder.
  *
  * The surface is pino-compatible (level, trace..fatal, silent, child), so it can
  * be handed to Fastify as `loggerInstance`. It is promoted from fc-coordinator's
@@ -62,6 +63,12 @@ export const RESERVED_LOG_KEYS = [
 const OWNED = new Set(['time', 'level', 'service', 'version', 'msg', 'trace_id', 'span_id']);
 /** Reserved keys a caller sets through the merge object; each is typed on the way out. */
 const CALLER_RESERVED = new Set(['event', 'call', 'code', 'duration_ms', 'peer', 'job', 'err', 'queue_ms']);
+/**
+ * The shape's code as the library writes it: ok, runJob's error, a Connect code name (connect.ts codeName) or an HTTP
+ * status. Any other string under the call's own code prints as the placeholder; a number prints.
+ */
+const SHAPE_CODE =
+  /^(?:ok|error|canceled|unknown|invalid_argument|deadline_exceeded|not_found|already_exists|permission_denied|resource_exhausted|failed_precondition|aborted|out_of_range|unimplemented|internal|unavailable|data_loss|unauthenticated|[1-5][0-9]{2})$/;
 
 const SEVERITY: Record<LevelSetting, number> = {
   trace: 10,
@@ -724,8 +731,11 @@ function buildEntry(
 
   const call = reserved['call'] === undefined ? '' : reservedText(reserved['call'], core.redact).split(/[?#]/)[0].trim();
   if (call !== '') entry['call'] = call;
-  if (typeof reserved['code'] === 'string' || typeof reserved['code'] === 'number') {
-    entry['code'] = reservedText(String(reserved['code']), core.redact);
+  const code = reserved['code'];
+  if (typeof code === 'string' || typeof code === 'number') {
+    // A query handed to the call as its fields ({ ...req.query }) brings an OAuth code here: only the shape's codes print.
+    entry['code'] =
+      typeof code === 'number' || SHAPE_CODE.test(code) ? reservedText(String(code), core.redact) : placeholder(core.redact);
   }
   const duration = nonNegativeMs(reserved['duration_ms']);
   if (duration !== undefined) entry['duration_ms'] = duration;

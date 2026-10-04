@@ -139,9 +139,13 @@ an error code under `code` in a plain object is masked too (an Error prints as
 `{name, message, stack}`, never through its `code` key). A number, a boolean,
 null and an object under them print, and so does any other key with the word
 `code` (`statusCode`, `jan_code`, `error_code`). The log shape's own `code`
-field, a top-level key of the call (a Connect code name or an HTTP status), is
-never masked, so a query spread into a call (`log.info({ ...req.query })`)
-prints its `code`. `call` is also cut at its first `?` or `#`.
+field (a top-level `code` or `Code` of the call or of a child's bindings)
+prints a string only when it is a code the library writes: `ok`, `error`, one
+of the 16 Connect code names, or a three-digit status from 100 to 599. Any
+other string prints as the placeholder, so a query handed to the call as its
+fields (`log.info(req.query)`, `log.info({ ...req.query })`) does not print
+its OAuth code. A number prints as a string. `call` is also cut at its first
+`?` or `#`.
 
 - a `scheme://` or `//` URL anywhere in the text loses its userinfo, and its
   query and fragment up to the next whitespace (a quote does not end it; a
