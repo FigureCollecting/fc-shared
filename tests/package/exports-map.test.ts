@@ -4,7 +4,13 @@
  * declared correctly, that the root barrel is untouched, and that the stateful
  * modules stay unreachable by a second path.
  */
-import { SUBPATHS, readPackageJson } from './package-contract';
+import {
+  LOG_SCHEMA_FILE,
+  LOG_SCHEMA_SUBPATH,
+  SERVER_SUBPATHS,
+  SUBPATHS,
+  readPackageJson,
+} from './package-contract';
 
 /** true when `version` is at least `floor` (both plain x.y.z). */
 function atLeast(version: string, floor: string): boolean {
@@ -62,5 +68,45 @@ describe('package.json exports map', () => {
 
   it('is at or beyond 1.7.0, the additive minor that added subpath exports', () => {
     expect(atLeast(pkg.version, '1.7.0')).toBe(true);
+  });
+});
+
+describe('package.json exports map: node-only server subpaths (1.8.0)', () => {
+  const pkg = readPackageJson() as ReturnType<typeof readPackageJson> & {
+    peerDependencies: Record<string, string>;
+    peerDependenciesMeta: Record<string, { optional?: boolean }>;
+    dependencies: Record<string, string>;
+  };
+  const cases = SERVER_SUBPATHS.map((spec) => [spec.subpath, spec] as const);
+
+  it.each(cases)('%s resolves for types, import and require, types first', (_subpath, spec) => {
+    expect(pkg.exports[spec.subpath]).toEqual({ types: spec.types, import: spec.import, require: spec.require });
+    expect(Object.keys(pkg.exports[spec.subpath] as Record<string, string>)[0]).toBe('types');
+  });
+
+  it('publishes the log-shape schema at a stable subpath', () => {
+    expect(pkg.exports[LOG_SCHEMA_SUBPATH]).toBe(LOG_SCHEMA_FILE);
+    expect(pkg.files).toContain('schema');
+  });
+
+  it('adds no runtime dependency: the OpenTelemetry SDK and Connect are OPTIONAL peers', () => {
+    expect(Object.keys(pkg.dependencies).sort()).toEqual(['@opentelemetry/api', 'axios', 'zustand']);
+    const serverPeers = [
+      '@connectrpc/connect',
+      '@opentelemetry/context-async-hooks',
+      '@opentelemetry/core',
+      '@opentelemetry/exporter-trace-otlp-grpc',
+      '@opentelemetry/instrumentation',
+      '@opentelemetry/resources',
+      '@opentelemetry/sdk-trace',
+    ];
+    for (const peer of serverPeers) {
+      expect({ peer, range: typeof pkg.peerDependencies[peer], optional: pkg.peerDependenciesMeta[peer]?.optional })
+        .toEqual({ peer, range: 'string', optional: true });
+    }
+  });
+
+  it('is at or beyond 1.8.0, the additive minor that added the server subpaths', () => {
+    expect(atLeast(pkg.version, '1.8.0')).toBe(true);
   });
 });

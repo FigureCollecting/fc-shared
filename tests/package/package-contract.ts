@@ -79,6 +79,68 @@ export const SUBPATHS: readonly SubpathSpec[] = [
 ];
 
 /**
+ * The NODE-ONLY server subpaths (lg-logging U1). Built separately with
+ * --platform=node so the browser entry points stay byte-identical; nothing in
+ * the barrel or the browser-safe subpaths may ever reach them.
+ */
+export const SERVER_SUBPATHS: readonly SubpathSpec[] = [
+  {
+    subpath: './server/log',
+    types: './dist/server/log.d.ts',
+    import: './dist/server/log.mjs',
+    require: './dist/server/log.js',
+    runtimeExports: ['createLogger', 'installConsoleBridge', 'resolveServiceIdentity', 'RESERVED_LOG_KEYS'],
+  },
+  {
+    subpath: './server/tracing',
+    types: './dist/server/tracing.d.ts',
+    import: './dist/server/tracing.mjs',
+    require: './dist/server/tracing.js',
+    runtimeExports: [
+      'startTracing',
+      'ESM_LOADER_HOOK',
+      'esmLoaderHookPath',
+      'RedactingSpanExporter',
+      'AllowlistPropagator',
+      'DEFAULT_PROPAGATION_HOSTS',
+    ],
+  },
+  {
+    subpath: './server/connect',
+    types: './dist/server/connect.d.ts',
+    import: './dist/server/connect.mjs',
+    require: './dist/server/connect.js',
+    runtimeExports: ['rpcServerInterceptor', 'rpcClientInterceptor'],
+  },
+  {
+    subpath: './server/express',
+    types: './dist/server/express.d.ts',
+    import: './dist/server/express.mjs',
+    require: './dist/server/express.js',
+    runtimeExports: ['httpLogMiddleware'],
+  },
+  {
+    subpath: './server/job',
+    types: './dist/server/job.d.ts',
+    import: './dist/server/job.mjs',
+    require: './dist/server/job.js',
+    runtimeExports: ['runJob', 'currentTraceparent', 'withTraceparent'],
+  },
+];
+
+/** The published log contract consumers validate their own lines against. */
+export const LOG_SCHEMA_SUBPATH = './server/log-shape.schema.json';
+export const LOG_SCHEMA_FILE = './schema/log-shape.schema.json';
+
+/**
+ * What a browser-reachable module graph must never resolve: the OpenTelemetry
+ * SDK, exporters and instrumentation, and Connect. (Node builtins are checked
+ * by the esbuild browser bundle, where axios resolves to its browser build.)
+ */
+export const SERVER_ONLY_SPECIFIER =
+  /^(?:@opentelemetry\/(?:sdk-|exporter-|instrumentation|resources|core|context-async-hooks)|@connectrpc\/)/;
+
+/**
  * Packages a stateless subpath must never drag into a consumer's module graph.
  * A Node service importing `getTraceContext` from the barrel pulls all three.
  */

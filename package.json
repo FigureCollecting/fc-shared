@@ -1,7 +1,7 @@
 {
   "name": "@figurecollecting/fc-shared",
-  "version": "1.7.0",
-  "description": "Shared types, API client, and stores for Figure Collector frontends",
+  "version": "1.8.0",
+  "description": "Shared types, API client and stores for Figure Collector frontends, plus node-only log and trace subpaths for services",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -31,11 +31,38 @@
       "import": "./dist/types/index.mjs",
       "require": "./dist/types/index.js"
     },
+    "./server/log": {
+      "types": "./dist/server/log.d.ts",
+      "import": "./dist/server/log.mjs",
+      "require": "./dist/server/log.js"
+    },
+    "./server/tracing": {
+      "types": "./dist/server/tracing.d.ts",
+      "import": "./dist/server/tracing.mjs",
+      "require": "./dist/server/tracing.js"
+    },
+    "./server/connect": {
+      "types": "./dist/server/connect.d.ts",
+      "import": "./dist/server/connect.mjs",
+      "require": "./dist/server/connect.js"
+    },
+    "./server/express": {
+      "types": "./dist/server/express.d.ts",
+      "import": "./dist/server/express.mjs",
+      "require": "./dist/server/express.js"
+    },
+    "./server/job": {
+      "types": "./dist/server/job.d.ts",
+      "import": "./dist/server/job.mjs",
+      "require": "./dist/server/job.js"
+    },
+    "./server/log-shape.schema.json": "./schema/log-shape.schema.json",
     "./tsconfig.base.json": "./tsconfig.base.json",
     "./package.json": "./package.json"
   },
   "files": [
     "dist",
+    "schema",
     "tsconfig.base.json"
   ],
   "repository": {
@@ -49,8 +76,9 @@
     "node": ">=24.15.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && npm run build:esm",
+    "build": "tsc -p tsconfig.build.json && npm run build:esm && npm run build:server",
     "build:esm": "esbuild src/index.ts src/utils/trace.ts src/utils/sanitize.ts src/utils/logger.ts src/types/index.ts --bundle --splitting --format=esm --platform=neutral --packages=external --outbase=src --outdir=dist --out-extension:.js=.mjs --sourcemap",
+    "build:server": "esbuild src/server/log.ts src/server/tracing.ts src/server/connect.ts src/server/express.ts src/server/job.ts --bundle --splitting --format=esm --platform=node --packages=external --outbase=src --outdir=dist --out-extension:.js=.mjs --chunk-names=server/chunks/[name]-[hash] --sourcemap",
     "lint": "tsc --noEmit",
     "test": "jest",
     "test:ci": "jest --ci --coverage",
@@ -63,23 +91,65 @@
     "zustand": "^5.0.15"
   },
   "peerDependencies": {
+    "@connectrpc/connect": "^2.0.0",
+    "@opentelemetry/context-async-hooks": "^2.11.0",
+    "@opentelemetry/core": "^2.11.0",
+    "@opentelemetry/exporter-trace-otlp-grpc": ">=0.222.0 <1",
+    "@opentelemetry/instrumentation": ">=0.222.0 <1",
+    "@opentelemetry/resources": "^2.11.0",
+    "@opentelemetry/sdk-trace": "^2.11.0",
     "react": ">=18.0.0"
   },
   "peerDependenciesMeta": {
+    "@connectrpc/connect": {
+      "optional": true
+    },
+    "@opentelemetry/context-async-hooks": {
+      "optional": true
+    },
+    "@opentelemetry/core": {
+      "optional": true
+    },
+    "@opentelemetry/exporter-trace-otlp-grpc": {
+      "optional": true
+    },
+    "@opentelemetry/instrumentation": {
+      "optional": true
+    },
+    "@opentelemetry/resources": {
+      "optional": true
+    },
+    "@opentelemetry/sdk-trace": {
+      "optional": true
+    },
     "react": {
       "optional": true
     }
   },
   "devDependencies": {
+    "@bufbuild/protobuf": "^2.16.0",
+    "@connectrpc/connect": "^2.2.0",
     "@opentelemetry/context-async-hooks": "^2.11.0",
+    "@opentelemetry/core": "^2.11.0",
+    "@opentelemetry/exporter-trace-otlp-grpc": "^0.222.0",
+    "@opentelemetry/instrumentation": "^0.222.0",
+    "@opentelemetry/instrumentation-http": "^0.222.0",
+    "@opentelemetry/instrumentation-undici": "^0.32.0",
+    "@opentelemetry/resources": "^2.11.0",
+    "@opentelemetry/sdk-trace": "^2.11.0",
+    "@types/express": "^5.0.6",
     "@types/jest": "^30.0.0",
     "@types/node": "^26.4.0",
     "@types/react": "^19.2.18",
+    "@types/supertest": "^7.2.1",
+    "ajv": "^8.20.0",
     "esbuild": "^0.28.2",
+    "express": "^5.2.1",
     "jest": "^30.5.1",
     "jest-extended": "^7.0.0",
     "msw": "^2.15.0",
     "react": "^19.2.8",
+    "supertest": "^7.3.0",
     "ts-jest": "^29.4.12",
     "typescript": "^6.0.3"
   },
