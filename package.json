@@ -152,8 +152,5 @@
     "supertest": "^7.3.0",
     "ts-jest": "^29.4.12",
     "typescript": "^6.0.3"
-  },
-  "overrides": {
-    "js-yaml@3": "3.15.1"
   }
 }
