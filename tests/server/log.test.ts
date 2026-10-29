@@ -5,7 +5,7 @@
  * no newline inside it, reserved keys typed and in contract order, trace ids
  * present only under a real span. The schema check uses the published file.
  */
-import { context, trace, ROOT_CONTEXT } from '@opentelemetry/api';
+import { context, createContextKey, trace, ROOT_CONTEXT } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -528,7 +528,7 @@ describe('server log levels, identity and bindings', () => {
   it('exposes the reserved key list in contract order', () => {
     expect(RESERVED_LOG_KEYS).toEqual([
       'time', 'level', 'service', 'version', 'event', 'msg', 'call', 'code', 'duration_ms',
-      'peer', 'trace_id', 'span_id', 'job', 'err', 'queue_ms',
+      'peer', 'trace_id', 'span_id', 'job', 'err', 'queue_ms', 'run_id',
     ]);
   });
 
@@ -2461,5 +2461,133 @@ describe('printing a value never throws and stays bounded', () => {
     target.log('rows', { rows });
     uninstall();
     expect((msgs()[0] as string).startsWith('rows {"rows":[{"a":{"b":"[truncated:max-depth]"}},')).toBe(true);
+  });
+});
+
+describe('run_id: the run a line belongs to (the OTel context key fc.run_id)', () => {
+  const RUN_ID = 'a'.repeat(32);
+  // createContextKey is Symbol.for: this is the very key server/job sets.
+  const RUN_KEY = createContextKey('fc.run_id');
+  const inRun = <T>(runId: unknown, fn: () => T): T => context.with(context.active().setValue(RUN_KEY, runId), fn);
+
+  it('prints the active run id as run_id, after queue_ms and before the event fields', () => {
+    const { log, parsed } = logger({ bindings: { job: 'ingest-crawler-1' } });
+    // withRemoteSpan starts from ROOT_CONTEXT, so the run goes inside it.
+    withRemoteSpan(() =>
+      inRun(RUN_ID, () =>
+        log.error(
+          {
+            event: 'item.process',
+            call: 'GET /x',
+            code: 'error',
+            duration_ms: 3,
+            peer: 'unmeshed',
+            err: new Error('x'),
+            queue_ms: 4,
+            site: 'orzgk',
+          },
+          'm',
+        ),
+      ),
+    );
+    const [line] = parsed();
+    expect(line.run_id).toBe(RUN_ID);
+    expect(Object.keys(line)).toEqual([...RESERVED_LOG_KEYS, 'site']);
+    expectValidLine(line);
+  });
+
+  it('carries run_id without a span, and in the text format at the same place', () => {
+    const json = logger();
+    inRun(RUN_ID, () => json.log.info({ site: 'orzgk' }, 'm'));
+    expect(Object.keys(json.parsed()[0])).toEqual(['time', 'level', 'service', 'version', 'event', 'msg', 'run_id', 'site']);
+    expectValidLine(json.parsed()[0]);
+
+    const text = logger({ format: 'text' });
+    inRun(RUN_ID, () => text.log.info({ event: 'job.end', code: 'ok', duration_ms: 5, site: 'orzgk' }, 'done'));
+    expect(text.lines[0]).toMatch(new RegExp(` job\\.end done code=ok duration_ms=5 run_id=${RUN_ID} site=orzgk$`));
+  });
+
+  it('leaves run_id absent outside a run: never null, never empty, also under a span', () => {
+    const { log, lines, parsed } = logger();
+    log.info('no run');
+    withRemoteSpan(() => log.info('a span, no run'));
+    expect(parsed().map((line) => 'run_id' in line)).toEqual([false, false]);
+    expect(lines.join('')).not.toContain('run_id');
+  });
+
+  it.each([
+    ['a zeroed id', '0'.repeat(32)],
+    ['an uppercase id', RUN_ID.toUpperCase()],
+    ['a short id', 'abc'],
+    ['an empty string', ''],
+    ['a number', 42],
+    ['an object', { id: RUN_ID }],
+  ])('prints no run_id when the context carries %s instead of a trace id', (_label, value) => {
+    const { log, parsed } = logger();
+    inRun(value, () => log.info('m'));
+    expect(parsed()[0]).not.toHaveProperty('run_id');
+  });
+
+  it("lets the caller's own run_id win over the active one, as a merge field, a camelCase spelling or a binding", () => {
+    const { log, parsed } = logger();
+    const child = log.child({ run_id: 'b'.repeat(32) });
+    inRun(RUN_ID, () => {
+      log.info({ run_id: 'c'.repeat(32) }, 'field');
+      log.info({ runId: 'd'.repeat(32) }, 'camel');
+      child.info('binding');
+      child.info({ run_id: 'e'.repeat(32) }, 'field beats binding');
+    });
+    expect(parsed().map((line) => line.run_id)).toEqual(['c', 'd', 'b', 'e'].map((ch) => ch.repeat(32)));
+    expect(parsed().every((line) => !('runId' in line))).toBe(true);
+  });
+
+  it("prints a caller's run_id outside a run too, typed as a string", () => {
+    const { log, parsed } = logger();
+    log.info({ run_id: 'relayed-run' }, 'a');
+    log.info({ run_id: 42 }, 'b');
+    expect(parsed().map((line) => line.run_id)).toEqual(['relayed-run', '42']);
+    parsed().forEach(expectValidLine);
+  });
+
+  it.each([
+    ['null', null],
+    ['an empty string', ''],
+    ['a blank string', '   '],
+    ['a boolean', true],
+    ['an object', { id: 'x' }],
+  ])("treats a caller's run_id that is %s as no value: the active run id prints, else none", (_label, value) => {
+    const { log, parsed } = logger();
+    inRun(RUN_ID, () => log.info({ run_id: value }, 'in a run'));
+    log.info({ run_id: value }, 'outside');
+    const [inside, outside] = parsed();
+    expect(inside.run_id).toBe(RUN_ID);
+    expect(outside).not.toHaveProperty('run_id');
+    expectValidLine(inside);
+    expectValidLine(outside);
+  });
+
+  it("passes a caller's run_id through the one redaction policy and keeps it on one line", () => {
+    const { log, parsed } = logger();
+    log.info({ run_id: 'https://user:pw@host.example/run/7?token=abc#frag' }, 'url');
+    log.info({ run_id: 'forged\nrun' }, 'newline');
+    log.info({ run_id: 'Bearer abcdefghijklmnop' }, 'secret shape');
+    expect(parsed().map((line) => line.run_id)).toEqual([
+      'https://host.example/run/7',
+      'forged run',
+      '[REDACTED]',
+    ]);
+  });
+
+  it('leaves redaction of every other value untouched inside a run', () => {
+    const inside = logger();
+    const outside = logger();
+    const fields = { password: 'hunter2', note: 'see https://x.example/a?token=abc', cookie: 'sid=1' };
+    const message = 'GET https://x.example/b?sig=zzz';
+    inRun(RUN_ID, () => inside.log.info(fields, message));
+    outside.log.info(fields, message);
+    const strip = ({ time: _t, run_id: _r, ...rest }: Record<string, unknown>) => rest;
+    expect(inside.parsed()[0].run_id).toBe(RUN_ID);
+    expect(strip(inside.parsed()[0])).toEqual(strip(outside.parsed()[0]));
+    expect(inside.parsed()[0]).toMatchObject({ password: '[REDACTED]', cookie: '[REDACTED]', msg: 'GET https://x.example/b' });
   });
 });

@@ -64,7 +64,16 @@ describe('log-shape.schema.json', () => {
     expectValidLine({ ...EXAMPLE_JOB_END, event: 'app.enrichment', winner_trace_id: winner });
   });
 
+  it("accepts run_id: the run's trace id, or a caller's own string", () => {
+    expectValidLine({ ...EXAMPLE_JOB_END, run_id: TRACE_ID });
+    expectValidLine({ ...EXAMPLE_RPC_IN, run_id: 'c'.repeat(32) });
+    expectValidLine({ ...EXAMPLE_JOB_END, run_id: 'relayed-run' });
+  });
+
   const rejects: Array<[string, Record<string, unknown>]> = [
+    ['an empty run_id', { ...EXAMPLE_JOB_END, run_id: '' }],
+    ['a null run_id', { ...EXAMPLE_JOB_END, run_id: null }],
+    ['a numeric run_id', { ...EXAMPLE_JOB_END, run_id: 42 }],
     ['a winner_trace_id that is not a trace id', { ...EXAMPLE_JOB_END, event: 'app.log', winner_trace_id: 'not-a-trace-id' }],
     ['a zeroed winner_trace_id', { ...EXAMPLE_JOB_END, event: 'app.log', winner_trace_id: '0'.repeat(32) }],
     ['an uppercase winner_trace_id', { ...EXAMPLE_JOB_END, event: 'app.log', winner_trace_id: TRACE_ID.toUpperCase() }],

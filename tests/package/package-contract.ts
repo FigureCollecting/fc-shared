@@ -124,7 +124,7 @@ export const SERVER_SUBPATHS: readonly SubpathSpec[] = [
     types: './dist/server/job.d.ts',
     import: './dist/server/job.mjs',
     require: './dist/server/job.js',
-    runtimeExports: ['runJob', 'currentTraceparent', 'withTraceparent'],
+    runtimeExports: ['runJob', 'currentTraceparent', 'currentRunId', 'withTraceparent'],
   },
 ];
 

@@ -64,13 +64,26 @@ barrel or the browser-safe subpaths can reach them (`tests/package` checks both)
 | `server/tracing` | `startTracing`, `RedactingSpanExporter`, `AllowlistPropagator`, `ESM_LOADER_HOOK`, `esmLoaderHookPath` |
 | `server/connect` | `rpcServerInterceptor`, `rpcClientInterceptor` (rpc.in / rpc.out) |
 | `server/express` | `httpLogMiddleware` (http.in, route template as `call`) |
-| `server/job` | `runJob`, `itemContext`, `currentTraceparent`, `withTraceparent` |
+| `server/job` | `runJob`, `itemContext`, `currentTraceparent`, `currentRunId`, `withTraceparent` |
 | `server/log-shape.schema.json` | the log-line contract (JSON Schema 2020-12) for consumers' tests |
 
 Every line is one JSON object on stdout: `time level service version event msg`,
-then `call code duration_ms peer trace_id span_id job err queue_ms` when they
-apply, then the event's own snake_case fields. `trace_id`/`span_id` are present
-only under an active span, never zeroed.
+then `call code duration_ms peer trace_id span_id job err queue_ms run_id` when
+they apply, then the event's own snake_case fields. `trace_id`/`span_id` are
+present only under an active span, never zeroed.
+
+**Run id (1.9.0).** Every line written inside a `runJob` run or one of its
+items carries `run_id`, the run's trace id, so one query on `run_id` finds the
+whole run while `trace_id` finds one item (each item is its own root trace,
+linked to the run). It rides the OpenTelemetry context under the key
+`fc.run_id`, set by `runJob`, `run.item` and `itemContext`; it is absent
+outside a run and when no tracing SDK gives the run a real trace id, never
+null or empty. It is the last reserved key, so every earlier key keeps its
+place (media-manager prints it there too). A caller's own `run_id` (a string,
+or a number printed as text) wins; a blank one does not. Across a queue, store
+`currentRunId()` next to `currentTraceparent()` and restore both with
+`withTraceparent(traceparent, fn, { runId })`; without a usable `runId` the
+worker keeps the run active where it calls `withTraceparent`, if any.
 
 The OpenTelemetry SDK and Connect are **optional peer dependencies**; a service
 that uses `server/tracing` or `server/connect` installs them:
@@ -118,8 +131,9 @@ and `runJob`'s final flush do wait, at most `exportTimeoutMillis` (default
 
 **Log redaction.** Every value the logger prints (`msg` and its parts,
 `err.type` and `err.message`, each extra field and object key, the reserved
-`call`, `code`, `peer`, `job` and `event`, and every bridged or printf console
-argument) goes through one policy, with the logger's own options. An Error's
+`call`, `code`, `peer`, `job`, `event` and a caller's `run_id`, and every
+bridged or printf console argument) goes through one policy, with the logger's
+own options. An Error's
 message is printed by it wherever it appears: as `err.message`, in `msg`
 (`console.error(err)`, `log.info('failed', err)`) and in its stack. A key that
 names a secret (`password`, `token`, `cookie` ...) has its value masked, also
