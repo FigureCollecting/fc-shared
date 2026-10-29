@@ -7,9 +7,9 @@
  *
  * RESERVED keys are typed and always in that order. trace_id/span_id come only
  * from the ACTIVE span and are absent (never zeroed) without one. run_id (1.9.0,
- * last so every earlier key keeps its place, as media-manager prints it) is the
- * run's trace id on every line of a server/job run and its items, read from
- * the context key fc.run_id; absent outside a run; a caller's own run_id wins.
+ * last so every earlier key keeps its place) is the run's trace id on every
+ * line of a server/job run and its items, read from the context key fc.run_id;
+ * absent outside a run; a caller's own run_id wins, in the same place.
  * Every other key is normalised to lowercase snake_case with a flat scalar
  * value: strings are redacted by fc-shared's policy and made log-injection safe
  * (sanitizeLogValue: no newlines, 1000-char cap); objects become one-line JSON.

@@ -14,6 +14,7 @@ import {
   trace,
   type TracerProvider,
 } from '@opentelemetry/api';
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { InMemorySpanExporter, type ReadableSpan } from '@opentelemetry/sdk-trace';
 import { createLogger } from '../../src/server/log';
 import { currentRunId, currentTraceparent, itemContext, runJob, withTraceparent } from '../../src/server/job';
@@ -344,12 +345,32 @@ describe('run_id on every line of a run and of its items', () => {
     expect(currentRunId()).toBeUndefined();
   });
 
-  it('has no currentRunId when no tracing SDK gives the run a real trace id', async () => {
+  it('has no run_id when no tracer provider gives the run a real trace id, even with context propagation on', async () => {
+    // Shutting tracing down also drops the context manager, which would hide run_id for the wrong reason:
+    // keep one, so only the all-zero run trace id stands between the run and its lines.
     await tracing?.shutdown();
     tracing = undefined;
-    const { logger } = jobLogger();
-    const seen = await runJob('ingest-crawler', (run) => run.item(() => currentRunId()), { logger });
-    expect(seen).toBeUndefined();
+    context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
+    try {
+      const { logger, parsed } = jobLogger();
+      let runId = '';
+      const seen = await runJob('ingest-crawler', (run) => {
+        runId = run.runId;
+        return run.item(() => {
+          logger.info({ event: 'item.enqueue' }, 'no provider');
+          return currentRunId();
+        });
+      }, { logger });
+      expect(runId).toBe('0'.repeat(32));
+      expect(seen).toBeUndefined();
+      expect(parsed().map((line) => [line.event, 'run_id' in line])).toEqual([
+        ['job.start', false],
+        ['item.enqueue', false],
+        ['job.end', false],
+      ]);
+    } finally {
+      context.disable();
+    }
   });
 
   it("lets a caller's own run_id win inside a run", async () => {
@@ -385,18 +406,84 @@ describe('run_id across a queue: withTraceparent(traceparent, fn, { runId })', (
     expectValidLine(worker);
   });
 
-  it('keeps the run active at the call site when no runId is given', async () => {
+  it("drops the call site's run when no runId is stored, as it drops the call site's trace", async () => {
     const { logger, parsed } = jobLogger();
     const runId = await runJob('ingest-crawler', (run) => {
       withTraceparent(TRACEPARENT, () => logger.info({ event: 'item.process', duration_ms: 1 }, 'in-run worker'));
       withTraceparent('garbage', () => logger.info({ event: 'app.bad_parent' }, 'bad traceparent'));
+      logger.info({ event: 'app.after' }, 'back in the run');
       return run.runId;
     }, { logger });
     const lines = parsed();
-    expect(lines.find((line) => line.event === 'item.process')).toMatchObject({ run_id: runId, trace_id: TRACE_ID });
+    const worker = lines.find((line) => line.event === 'item.process') as Record<string, unknown>;
+    expect(worker.trace_id).toBe(TRACE_ID);
+    expect(worker).not.toHaveProperty('run_id');
     const bad = lines.find((line) => line.event === 'app.bad_parent') as Record<string, unknown>;
-    expect(bad.run_id).toBe(runId);
+    expect(bad).not.toHaveProperty('run_id');
     expect(bad).not.toHaveProperty('trace_id');
+    expect(lines.find((line) => line.event === 'app.after')?.run_id).toBe(runId);
+  });
+
+  it("does not stamp a worker's run on a producer's item restored without its runId", async () => {
+    const { logger, parsed } = jobLogger();
+    const stored: string[] = [];
+    const producer = await runJob('producer', async (run) => {
+      await run.item(() => {
+        stored.push(currentTraceparent() as string);
+      });
+      return run.runId;
+    }, { logger });
+    const worker = await runJob('worker', (run) => {
+      // A 1.8.0-style caller: the traceparent only.
+      withTraceparent(stored[0], () => logger.info({ event: 'item.process' }, 'restored'));
+      return run.runId;
+    }, { logger });
+
+    const line = parsed().find((l) => l.event === 'item.process') as Record<string, unknown>;
+    const item = exporter.getFinishedSpans().find((span) => span.spanContext().traceId === line.trace_id);
+    expect(item?.attributes['fc.run_id']).toBe(producer);
+    expect(producer).not.toBe(worker);
+    expect(line).not.toHaveProperty('run_id');
+  });
+
+  it('gives a worker started inside a run only the run each entry stored', async () => {
+    const { logger, parsed } = jobLogger();
+    const queue: Array<{ traceparent?: string; runId?: string } | 'stop'> = [];
+    let wake: () => void = () => undefined;
+    const next = async () => {
+      while (queue.length === 0) await new Promise<void>((resolve) => { wake = resolve; });
+      return queue.shift() as (typeof queue)[number];
+    };
+    let worker: Promise<void> = Promise.resolve();
+    const runA = await runJob('runa', async (run) => {
+      await run.item(async () => {
+        // Started lazily by run A's item: its loop inherits run A's context for good.
+        worker = (async () => {
+          for (let entry = await next(); entry !== 'stop'; entry = await next()) {
+            const { traceparent, runId } = entry;
+            withTraceparent(traceparent, () => logger.info({ event: 'item.process' }, 'worker'), { runId });
+          }
+        })();
+        queue.push({ traceparent: currentTraceparent(), runId: currentRunId() });
+        wake();
+      });
+      return run.runId;
+    }, { logger });
+    // An HTTP handler, in no run, enqueues the next entry.
+    const http = trace.getTracer('http').startActiveSpan('POST /enqueue', (span) => {
+      queue.push({ traceparent: currentTraceparent(), runId: currentRunId() });
+      span.end();
+      return span.spanContext().traceId;
+    });
+    queue.push('stop');
+    wake();
+    await worker;
+
+    const processed = parsed().filter((line) => line.event === 'item.process');
+    expect(processed).toHaveLength(2);
+    expect(processed[0].run_id).toBe(runA);
+    expect(processed[1].trace_id).toBe(http);
+    expect(processed[1]).not.toHaveProperty('run_id');
   });
 
   it("lets the stored runId win over the call site's run", async () => {
@@ -436,13 +523,35 @@ describe('run_id across a queue: withTraceparent(traceparent, fn, { runId })', (
     expect(parsed()[0].trace_id).toBe(TRACE_ID);
   });
 
-  it("falls back to the call site's run when the stored runId is unusable", async () => {
+  it.each([
+    ['garbage'],
+    [12345],
+    [{ id: 'c'.repeat(32) }],
+    [['c'.repeat(32)]],
+    [true],
+  ])("ignores a stored runId of %p inside a run: fn runs, no fallback to the call site's run", async (value) => {
     const { logger, parsed } = jobLogger();
-    const runId = await runJob('ingest-crawler', (run) => {
-      withTraceparent(TRACEPARENT, () => logger.info({ event: 'app.worker' }, 'w'), { runId: 'garbage' });
-      return run.runId;
+    // A queue payload comes back from JSON.parse typed any, so a wrong type still compiles.
+    const stored = JSON.parse(JSON.stringify({ traceparent: TRACEPARENT, runId: value }));
+    let ran = false;
+    await runJob('ingest-crawler', () => {
+      withTraceparent(stored.traceparent, () => {
+        ran = true;
+        logger.info({ event: 'app.worker' }, 'w');
+      }, { runId: stored.runId });
     }, { logger });
-    expect(parsed().find((line) => line.event === 'app.worker')?.run_id).toBe(runId);
+    expect(ran).toBe(true);
+    const line = parsed().find((l) => l.event === 'app.worker') as Record<string, unknown>;
+    expect(line.trace_id).toBe(TRACE_ID);
+    expect(line).not.toHaveProperty('run_id');
+  });
+
+  it('treats options passed as null (a JavaScript caller) as no options', () => {
+    const { logger, parsed } = jobLogger();
+    const untyped = withTraceparent as unknown as (traceparent: string, fn: () => void, options: null) => void;
+    untyped(TRACEPARENT, () => logger.info('worker'), null);
+    expect(parsed()[0].trace_id).toBe(TRACE_ID);
+    expect(parsed()[0]).not.toHaveProperty('run_id');
   });
 
   it('without a runId and outside a run, adds no run_id (the 1.8.0 behaviour)', () => {

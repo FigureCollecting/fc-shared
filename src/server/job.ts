@@ -192,8 +192,8 @@ export function parseTraceparent(value: string | null | undefined): SpanContext 
 
 export interface TraceparentOptions {
   /**
-   * The run the stored item belongs to (currentRunId() at enqueue), printed as run_id. Default, or when it is not a
-   * real trace id: the run active at the call site, if any.
+   * The run the stored item belongs to (currentRunId() at enqueue), printed as run_id. Without one that is a real
+   * trace id, fn runs in no run.
    */
   runId?: string | null;
 }
@@ -201,16 +201,18 @@ export interface TraceparentOptions {
 /**
  * Run fn with a stored traceparent as its parent, so a worker's spans and log
  * lines continue the enqueuer's trace. A missing or malformed value runs fn
- * with no parent at all rather than a broken one. The run id is not part of
- * the trace, so a bad traceparent keeps it: options.runId when that is a real
- * trace id, else the run active at the call site, if any.
+ * with no parent at all rather than a broken one. The run comes only from
+ * what was stored, like the trace: options.runId when that is a real trace id
+ * (kept even when the traceparent is bad), else none, never the call site's.
+ * A stored value of the wrong type (a queue payload is JSON) counts as none.
  */
 export function withTraceparent<T>(
   traceparent: string | null | undefined,
   fn: () => T,
-  options: TraceparentOptions = {},
+  options?: TraceparentOptions,
 ): T {
   const parent = parseTraceparent(traceparent);
-  const run = withRunId(withRunId(ROOT_CONTEXT, currentRunId()), options.runId?.trim());
+  const stored: unknown = options?.runId;
+  const run = withRunId(ROOT_CONTEXT, typeof stored === 'string' ? stored.trim() : undefined);
   return context.with(parent === undefined ? run : trace.setSpanContext(run, parent), fn);
 }

@@ -79,11 +79,14 @@ linked to the run). It rides the OpenTelemetry context under the key
 `fc.run_id`, set by `runJob`, `run.item` and `itemContext`; it is absent
 outside a run and when no tracing SDK gives the run a real trace id, never
 null or empty. It is the last reserved key, so every earlier key keeps its
-place (media-manager prints it there too). A caller's own `run_id` (a string,
-or a number printed as text) wins; a blank one does not. Across a queue, store
-`currentRunId()` next to `currentTraceparent()` and restore both with
-`withTraceparent(traceparent, fn, { runId })`; without a usable `runId` the
-worker keeps the run active where it calls `withTraceparent`, if any.
+place. A caller's own `run_id` (a string, or a number printed as text) wins
+and prints in that same place; a blank one does not. (media-manager prints the
+active run's id there too, but leaves a caller's own `run_id` among the
+event's fields, as given.) Across a queue, store `currentRunId()` next to
+`currentTraceparent()` and restore both with
+`withTraceparent(traceparent, fn, { runId })`. Like the trace, the run comes
+only from what was stored: without a usable `runId` the worker's lines carry
+no `run_id`, never the run active where it calls `withTraceparent`.
 
 The OpenTelemetry SDK and Connect are **optional peer dependencies**; a service
 that uses `server/tracing` or `server/connect` installs them:
