@@ -1,6 +1,6 @@
 {
   "name": "@figurecollecting/fc-shared",
-  "version": "1.9.0",
+  "version": "1.9.1",
   "description": "Shared types, API client and stores for Figure Collector frontends, plus node-only log and trace subpaths for services",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
