@@ -331,6 +331,44 @@ describe('run_id on every line of a run and of its items', () => {
     expect(parsed().find((line) => line.event === 'item.enqueue')?.run_id).toBe(runId);
   });
 
+  it("keeps an item's own run_id when it is started from inside another run", async () => {
+    const { logger, parsed } = jobLogger();
+    let runB = '';
+    const runA = await runJob('run-a', async (a) => {
+      runB = await runJob('run-b', async (b) => {
+        logger.info({ event: 'app.b', where: 'before' }, 'run B line');
+        // Run A's handle used while run B is the active run: the item still belongs to A.
+        await a.item(async () => {
+          logger.info({ event: 'app.a', where: 'sync' }, 'A item line');
+          expect(currentRunId()).toBe(a.runId);
+          await Promise.resolve();
+          logger.info({ event: 'app.a', where: 'after an await' }, 'A item line');
+          expect(currentRunId()).toBe(a.runId);
+        });
+        const batch = itemContext(a, { name: 'item.batch' });
+        context.with(batch.context, () => {
+          logger.info({ event: 'app.a', where: 'itemContext' }, 'A batch line');
+          expect(currentRunId()).toBe(a.runId);
+        });
+        batch.span.end();
+        logger.info({ event: 'app.b', where: 'after' }, 'run B line');
+        expect(currentRunId()).toBe(b.runId);
+        return b.runId;
+      }, { logger });
+      return a.runId;
+    }, { logger });
+
+    expect(runA).not.toBe(runB);
+    const lines = parsed();
+    const fromA = lines.filter((line) => line.event === 'app.a');
+    expect(fromA.map((line) => line.where)).toEqual(['sync', 'after an await', 'itemContext']);
+    expect(fromA.map((line) => line.run_id)).toEqual([runA, runA, runA]);
+    const fromB = lines.filter((line) => line.job === 'run-b' || line.event === 'app.b');
+    expect(fromB.map((line) => line.event)).toEqual(['job.start', 'app.b', 'app.b', 'job.end']);
+    expect(fromB.map((line) => line.run_id)).toEqual(fromB.map(() => runB));
+    lines.forEach(expectValidLine);
+  });
+
   it('leaves run_id off lines written after the run returns, and currentRunId undefined outside one', async () => {
     const { logger, parsed } = jobLogger();
     expect(currentRunId()).toBeUndefined();
