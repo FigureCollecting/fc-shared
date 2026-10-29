@@ -104,8 +104,10 @@ export function esmLoaderHookPath(fromDir: string = process.cwd()): string {
 /**
  * The estate's propagator stack, the one startTracing registers:
  * AllowlistPropagator(RunIdBaggagePropagator(W3C traceparent + baggage)).
- * A service on NodeSDK passes it as textMapPropagator. Keep the bridge inside
- * the allowlist: outside it, fc.run_id would reach third parties.
+ * A service on NodeSDK passes it as textMapPropagator. The W3C propagators
+ * write the headers, so they must stay inside the allowlist: outside it,
+ * traceparent and baggage, fc.run_id included, would reach third parties. The
+ * bridge writes no header; it only rewrites the context they read.
  */
 export function fcTextMapPropagator(isAllowed: (host: string) => boolean): TextMapPropagator {
   return new AllowlistPropagator(

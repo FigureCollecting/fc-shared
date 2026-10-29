@@ -15,10 +15,13 @@ import type { AddressInfo } from 'node:net';
 import {
   ROOT_CONTEXT,
   SpanKind,
+  baggageEntryMetadataFromString,
   context,
   createTraceState,
   propagation,
   trace,
+  type Baggage,
+  type BaggageEntry,
   type Context,
   type TextMapGetter,
   type TextMapPropagator,
@@ -322,6 +325,39 @@ describe('fcTextMapPropagator: the run id (fc.run_id) over the wire, inside the 
     expect(runIdOf(receive({ baggage: header }))).toBe(RUN);
   });
 
+  it('copies only the pairs the W3C injector can write, so a send stays linear in the in-process baggage', () => {
+    const ctx = withBaggage(withRunId(ROOT_CONTEXT, RUN), Object.fromEntries(Array.from({ length: 2000 }, (_, i) => [`k${i}`, 'v'])));
+    const setEntry = jest.spyOn(Object.getPrototypeOf(propagation.createBaggage()) as Baggage, 'setEntry');
+    try {
+      expect(send(ctx).baggage.split(',')).toEqual([`fc.run_id=${RUN}`, ...Array.from({ length: 179 }, (_, i) => `k${i}=v`)]);
+      expect(setEntry.mock.calls.length).toBeLessThanOrEqual(179);
+    } finally {
+      setEntry.mockRestore();
+    }
+  });
+
+  it('writes what the W3C injector writes for the whole baggage behind fc.run_id, pairs over 4096 bytes taking no slot', () => {
+    const entries: Array<[string, BaggageEntry]> = [
+      ['big', { value: 'x'.repeat(5000) }],
+      ['edge', { value: 'e'.repeat(4091) }], // edge=eee… is 4096 bytes: written
+      ['edge1', { value: 'e'.repeat(4091) }], // 4097 bytes: skipped
+      ['euro', { value: '€'.repeat(500) }], // 500 characters, 4500 bytes once encoded
+      ['meta', { value: 'v', metadata: baggageEntryMetadataFromString('p'.repeat(4100)) }],
+      ['fc.run_id', { value: OTHER }],
+      ...Array.from({ length: 200 }, (_, i): [string, BaggageEntry] => [`k${i}`, { value: 'v' }]),
+    ];
+    let inContext = propagation.createBaggage();
+    let whole = propagation.createBaggage({ [RUN_ID_BAGGAGE_KEY]: { value: RUN } });
+    for (const [key, entry] of entries) {
+      inContext = inContext.setEntry(key, entry);
+      if (key !== RUN_ID_BAGGAGE_KEY) whole = whole.setEntry(key, entry);
+    }
+    const expected: Record<string, string> = {};
+    W3C.inject(propagation.setBaggage(ROOT_CONTEXT, whole), expected, setter);
+    expect(expected.baggage.split(',')).toHaveLength(180);
+    expect(send(propagation.setBaggage(withRunId(ROOT_CONTEXT, RUN), inContext))).toEqual(expected);
+  });
+
   it('receives a valid fc.run_id as the run, with the trace, and strips it from the baggage', () => {
     const ctx = receive({ traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01`, baggage: `tenant=fc, fc.run_id=${RUN}` });
     expect(runIdOf(ctx)).toBe(RUN);
@@ -369,10 +405,32 @@ describe('fcTextMapPropagator: the run id (fc.run_id) over the wire, inside the 
     expect(baggageOf(ctx)).toEqual([['tenant', 'fc']]);
   });
 
-  it('promotes only a run id that came over the wire, never one already in the context baggage', () => {
-    const ctx = receive({ traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01` }, withBaggage(ROOT_CONTEXT, { 'fc.run_id': RUN, tenant: 'fc' }));
+  it.each([
+    ['no baggage header', {}],
+    ['a key with no value', { baggage: 'fc.run_id' }],
+    ['an empty value', { baggage: 'fc.run_id=' }],
+    ['a value that cannot be decoded', { baggage: 'fc.run_id=%ZZ' }],
+    ['a property and no value', { baggage: 'fc.run_id;p=1' }],
+    ['an entry over 4096 bytes', { baggage: `fc.run_id=${'a'.repeat(5000)}` }],
+  ])('promotes only a run id that came over the wire, never one already in the context baggage (%s)', (_name, headers) => {
+    const local = withBaggage(ROOT_CONTEXT, { 'fc.run_id': RUN, tenant: 'fc' });
+    const ctx = receive({ traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01`, ...headers }, local);
     expect(runIdOf(ctx)).toBeUndefined();
     expect(baggageOf(ctx)).toEqual([['tenant', 'fc']]);
+  });
+
+  it.each([
+    ['an operator label', 'run-1'],
+    ['uppercase hex', RUN.toUpperCase()],
+    ['all zero', '0'.repeat(32)],
+  ])('keeps the run of a context already in one when the inbound fc.run_id is invalid (%s)', (_name, value) => {
+    const ctx = receive({ baggage: `fc.run_id=${value},tenant=fc` }, withRunId(ROOT_CONTEXT, OTHER));
+    expect(runIdOf(ctx)).toBe(OTHER);
+    expect(baggageOf(ctx)).toEqual([['tenant', 'fc']]);
+  });
+
+  it('replaces the run of a context already in one with a valid inbound fc.run_id', () => {
+    expect(runIdOf(receive({ baggage: `fc.run_id=${RUN}` }, withRunId(ROOT_CONTEXT, OTHER)))).toBe(RUN);
   });
 
   it('leaves the context alone when nothing names a run', () => {

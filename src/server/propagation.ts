@@ -25,9 +25,11 @@
  * off-list host altogether, so such a request gets no auto span either; this
  * propagator stays as the second line for every other path.
  *
- * The run id crosses a process boundary as the W3C baggage entry fc.run_id,
- * bridged by RunIdBaggagePropagator INSIDE the allowlist, so it goes exactly
- * where traceparent goes. The context key stays the only in-process truth.
+ * The run id crosses a process boundary as the W3C baggage entry fc.run_id.
+ * RunIdBaggagePropagator bridges that entry and the context key; the W3C
+ * baggage propagator, which writes the header, sits INSIDE the allowlist, so
+ * the entry goes exactly where traceparent goes. The context key stays the
+ * only in-process truth.
  *
  * Depends only on @opentelemetry/api, so the Connect interceptors can use it
  * without pulling in the SDK.
@@ -36,6 +38,7 @@ import {
   SpanKind,
   createContextKey,
   propagation,
+  type BaggageEntry,
   type Context,
   type TextMapGetter,
   type TextMapPropagator,
@@ -176,7 +179,21 @@ function runIdEntriesIn(header: string | string[] | undefined): number {
   return entries.filter((entry) => baggageKeyOf(entry) === RUN_ID_BAGGAGE_KEY).length;
 }
 
-/** `ctx` with fc.run_id as the FIRST baggage entry when it carries a run; with no fc.run_id entry when it does not. */
+/** The most pairs the W3C baggage injector (@opentelemetry/core) writes; it keeps the first ones. */
+const W3C_MAX_PAIRS = 180;
+/** The longest pair it writes; it skips a longer one, which takes no slot. */
+const W3C_MAX_PAIR_BYTES = 4096;
+
+/** The length of the pair `key=value[;metadata]` as the W3C injector writes it. */
+function pairBytes(key: string, entry: BaggageEntry): number {
+  const metadata = entry.metadata === undefined ? 0 : 1 + entry.metadata.toString().length;
+  return encodeURIComponent(key).length + 1 + encodeURIComponent(entry.value).length + metadata;
+}
+
+/**
+ * `ctx` with fc.run_id as the FIRST baggage entry, then only the pairs the W3C injector can still write,
+ * when it carries a run; with no fc.run_id entry when it does not.
+ */
 function withRunIdBaggage(ctx: Context): Context {
   const runId = runIdOf(ctx);
   const baggage = propagation.getBaggage(ctx);
@@ -186,23 +203,35 @@ function withRunIdBaggage(ctx: Context): Context {
       : propagation.setBaggage(ctx, baggage.removeEntry(RUN_ID_BAGGAGE_KEY));
   }
   // First, so the W3C injector's 180-pair and 8192-byte cuts drop other entries, never this one.
+  // Every setEntry copies the baggage, so stop at the pairs the injector writes: copying the
+  // rest, which it drops anyway, made a send quadratic in the in-process baggage.
   let bridged = propagation.createBaggage({ [RUN_ID_BAGGAGE_KEY]: { value: runId } });
+  let pairs = 1;
   for (const [key, entry] of baggage?.getAllEntries() ?? []) {
-    if (key !== RUN_ID_BAGGAGE_KEY) bridged = bridged.setEntry(key, entry);
+    if (pairs === W3C_MAX_PAIRS) break;
+    if (key === RUN_ID_BAGGAGE_KEY || pairBytes(key, entry) > W3C_MAX_PAIR_BYTES) continue;
+    bridged = bridged.setEntry(key, entry);
+    pairs += 1;
   }
   return propagation.setBaggage(ctx, bridged);
 }
 
 /**
  * Bridges the run-id context key and the baggage entry fc.run_id around a W3C
- * delegate. Belongs INSIDE AllowlistPropagator (fcTextMapPropagator builds the
- * stack), so the run id goes only where traceparent goes.
- *   inject: the context's run, if any, as fc.run_id; any other fc.run_id entry
- *           (a stale or forged inbound one) is never forwarded.
+ * delegate. It writes no header itself: it only rewrites the context the
+ * delegate reads. The delegate's W3C baggage propagator writes the header, and
+ * that propagator is what must sit inside AllowlistPropagator
+ * (fcTextMapPropagator builds the stack), so the run id goes only where
+ * traceparent goes.
+ *   inject: the context's run, if any, as the first fc.run_id entry, then only
+ *           the pairs the W3C injector writes (the first 179 others of at most
+ *           4096 bytes), so a send stays linear in the baggage. Any other
+ *           fc.run_id entry (a stale or forged inbound one) is never forwarded.
  *   extract: after the delegate (W3C baggage extraction REPLACES the baggage),
- *           exactly one fc.run_id entry in the carrier, with no properties and
- *           a real trace id (32 lowercase hex, not all zero), becomes the run.
- *           The raw entry is always removed from the baggage.
+ *           exactly one fc.run_id entry parsed from the carrier, with no
+ *           properties and the shape of a trace id (32 lowercase hex, not all
+ *           zero), becomes the run; an entry already in the context's baggage
+ *           never does. The raw entry is always removed from the baggage.
  * A valid but forged value only mislabels log lines; the trust boundary is the mesh.
  */
 export class RunIdBaggagePropagator implements TextMapPropagator {
@@ -218,7 +247,10 @@ export class RunIdBaggagePropagator implements TextMapPropagator {
     const entry = baggage?.getEntry(RUN_ID_BAGGAGE_KEY);
     if (baggage === undefined || entry === undefined) return extracted;
     const stripped = propagation.setBaggage(extracted, baggage.removeEntry(RUN_ID_BAGGAGE_KEY));
-    const single = entry.metadata === undefined && runIdEntriesIn(getter.get(carrier, 'baggage')) === 1;
+    // W3C extraction keeps the context's own baggage when it parses no pair from the carrier,
+    // so an unchanged baggage means this entry was already here, not on the wire.
+    const fromWire = baggage !== propagation.getBaggage(ctx);
+    const single = fromWire && entry.metadata === undefined && runIdEntriesIn(getter.get(carrier, 'baggage')) === 1;
     return single ? withRunId(stripped, entry.value) : stripped;
   }
 

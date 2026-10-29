@@ -95,12 +95,12 @@ no `run_id`, never the run active where it calls `withTraceparent`.
 http instrumentation for inbound requests, `httpLogMiddleware`, the Connect
 server interceptor) serves the request in that run: `currentRunId()` returns it
 and the request's lines carry `run_id`. It accepts exactly one `fc.run_id`
-entry, without properties, that is a real trace id (32 lowercase hex, not all
-zero), and always removes the raw entry from the baggage. Outside a run nothing
-named `fc.run_id` is sent, whatever the baggage holds: the context key is the
-only source, so a hand-set `fc.run_id` baggage entry is replaced or dropped. A
-service on NodeSDK passes `fcTextMapPropagator(isAllowed)` as its
-`textMapPropagator`.
+entry in the request, without properties, shaped like a trace id (32 lowercase
+hex, not all zero), and always removes the raw entry from the baggage. Outside
+a run nothing named `fc.run_id` is sent, whatever the baggage holds: the
+context key is the only source, so a hand-set `fc.run_id` baggage entry is
+replaced or dropped. A service on NodeSDK passes
+`fcTextMapPropagator(isAllowed)` as its `textMapPropagator`.
 
 The OpenTelemetry SDK and Connect are **optional peer dependencies**; a service
 that uses `server/tracing` or `server/connect` installs them:
