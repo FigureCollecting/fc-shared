@@ -225,7 +225,8 @@ describe('runJob', () => {
 });
 
 describe('run_id on every line of a run and of its items', () => {
-  const tick = () => new Promise((resolve) => setTimeout(resolve, 1));
+  // A microtask yield: lets the concurrent items interleave without a real timer.
+  const tick = () => Promise.resolve();
 
   it("stamps the run's own lines (job.start, mid-run, job.end) with run_id = runId = the run's trace id", async () => {
     const { logger, parsed } = jobLogger();
