@@ -19,8 +19,9 @@
  *   - Propagation allowlist, OTEL_PROPAGATION_ALLOWLIST (default
  *     `*.svc.cluster.local,*.svc,localhost`): the http and undici
  *     instrumentations skip any other host (no auto span, no header), and the
- *     global propagator, W3C traceparent + baggage behind the
- *     AllowlistPropagator, injects for listed hosts only on every other path.
+ *     global propagator, fcTextMapPropagator (W3C traceparent + baggage, the
+ *     run id bridged into baggage as fc.run_id, all behind the
+ *     AllowlistPropagator), injects for listed hosts only on every other path.
  *   - An AsyncLocalStorage context manager is registered explicitly, so the
  *     active span survives `await`.
  *   - It must be the process's ONLY OpenTelemetry setup. If another one (e.g.
@@ -44,7 +45,7 @@
  */
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
-import { context, diag, propagation, trace } from '@opentelemetry/api';
+import { context, diag, propagation, trace, type TextMapPropagator } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { CompositePropagator, W3CBaggagePropagator, W3CTraceContextPropagator } from '@opentelemetry/core';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-grpc';
@@ -59,13 +60,15 @@ import {
 } from '@opentelemetry/sdk-trace';
 import type { RedactOptions } from '../utils/sanitize';
 import { resolveServiceIdentity, type Env } from './log';
-import { AllowlistPropagator, createHostAllowlist, propagationHostsFromEnv } from './propagation';
+import { AllowlistPropagator, RunIdBaggagePropagator, createHostAllowlist, propagationHostsFromEnv } from './propagation';
 import { RedactingSpanExporter, stripUrl } from './redact';
 
 export {
   AllowlistPropagator,
   DEFAULT_PROPAGATION_HOSTS,
   PROPAGATION_ALLOWLIST_ENV,
+  RUN_ID_BAGGAGE_KEY,
+  RunIdBaggagePropagator,
   createHostAllowlist,
   propagationHostsFromEnv,
   propagationTargetOf,
@@ -96,6 +99,23 @@ export function esmLoaderHookPath(fromDir: string = process.cwd()): string {
         'npm install @opentelemetry/instrumentation in the app (an optional peer of fc-shared).',
     );
   }
+}
+
+/**
+ * The estate's propagator stack, the one startTracing registers:
+ * AllowlistPropagator(RunIdBaggagePropagator(W3C traceparent + baggage)).
+ * A service on NodeSDK passes it as textMapPropagator. The W3C propagators
+ * write the headers, so they must stay inside the allowlist: outside it,
+ * traceparent and baggage, fc.run_id included, would reach third parties. The
+ * bridge writes no header; it only rewrites the context they read.
+ */
+export function fcTextMapPropagator(isAllowed: (host: string) => boolean): TextMapPropagator {
+  return new AllowlistPropagator(
+    new RunIdBaggagePropagator(
+      new CompositePropagator({ propagators: [new W3CTraceContextPropagator(), new W3CBaggagePropagator()] }),
+    ),
+    isAllowed,
+  );
 }
 
 export type ExporterKind = 'otlp' | 'noop' | 'custom';
@@ -260,12 +280,7 @@ export function startTracing(service: string, options: StartTracingOptions = {})
   const isAllowed = createHostAllowlist(propagateHosts);
   const registered = {
     context: context.setGlobalContextManager(contextManager),
-    propagation: propagation.setGlobalPropagator(
-      new AllowlistPropagator(
-        new CompositePropagator({ propagators: [new W3CTraceContextPropagator(), new W3CBaggagePropagator()] }),
-        isAllowed,
-      ),
-    ),
+    propagation: propagation.setGlobalPropagator(fcTextMapPropagator(isAllowed)),
     trace: trace.setGlobalTracerProvider(provider),
   };
   const taken = Object.entries(registered)

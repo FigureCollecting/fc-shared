@@ -15,6 +15,7 @@ import type { Instrumentation } from '@opentelemetry/instrumentation';
 import { HttpInstrumentation } from '@opentelemetry/instrumentation-http';
 import { UndiciInstrumentation } from '@opentelemetry/instrumentation-undici';
 import { InMemorySpanExporter, TracerProvider, type SpanExporter } from '@opentelemetry/sdk-trace';
+import { withRunId } from '../../src/server/fields';
 import { createLogger } from '../../src/server/log';
 import {
   ESM_LOADER_HOOK,
@@ -176,6 +177,19 @@ describe('startTracing without an endpoint (the no-op path)', () => {
     expect(injectFor('a.internal')).toHaveProperty('traceparent');
     // Replaced, not extended: a default the list left out gets nothing.
     expect(injectFor('scraper.fc.svc.cluster.local')).toEqual({});
+  });
+
+  it('registers fcTextMapPropagator: the run id travels as baggage fc.run_id to allowed hosts only', () => {
+    active = startTracing('scraper', { env: { OTEL_PROPAGATION_ALLOWLIST: 'ingest-server' } });
+    const run = 'c'.repeat(32);
+    const send = (target: string) => {
+      const carrier: Record<string, string> = {};
+      propagation.inject(withPropagationTarget(withRunId(ROOT_CONTEXT, run), target), carrier);
+      return carrier;
+    };
+    expect(send('http://ingest-server:50061/')).toEqual({ baggage: `fc.run_id=${run}` });
+    expect(send('http://scraper.fc.svc.cluster.local:3050/')).toEqual({});
+    expect(propagation.fields()).toEqual(['traceparent', 'tracestate', 'baggage']);
   });
 
   it('makes http and undici instrumentation skip every off-list host, keeps the caller\'s own ignore hook, and restores it on shutdown', async () => {

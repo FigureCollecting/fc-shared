@@ -61,7 +61,7 @@ barrel or the browser-safe subpaths can reach them (`tests/package` checks both)
 | Subpath | Exports |
 | --- | --- |
 | `server/log` | `createLogger` (pino-compatible), `installConsoleBridge`, `resolveServiceIdentity` |
-| `server/tracing` | `startTracing`, `RedactingSpanExporter`, `AllowlistPropagator`, `ESM_LOADER_HOOK`, `esmLoaderHookPath` |
+| `server/tracing` | `startTracing`, `fcTextMapPropagator`, `RedactingSpanExporter`, `AllowlistPropagator`, `RunIdBaggagePropagator`, `ESM_LOADER_HOOK`, `esmLoaderHookPath` |
 | `server/connect` | `rpcServerInterceptor`, `rpcClientInterceptor` (rpc.in / rpc.out) |
 | `server/express` | `httpLogMiddleware` (http.in, route template as `call`) |
 | `server/job` | `runJob`, `itemContext`, `currentTraceparent`, `currentRunId`, `withTraceparent` |
@@ -87,6 +87,20 @@ event's fields, as given.) Across a queue, store `currentRunId()` next to
 `withTraceparent(traceparent, fn, { runId })`. Like the trace, the run comes
 only from what was stored: without a usable `runId` the worker's lines carry
 no `run_id`, never the run active where it calls `withTraceparent`.
+
+**Run id across processes.** The propagator `startTracing` registers,
+`fcTextMapPropagator`, also sends the active run as the W3C baggage entry
+`fc.run_id`, first in the header, to the allowlisted hosts that get
+`traceparent` and to no other host. A receiver that extracts through it (the
+http instrumentation for inbound requests, `httpLogMiddleware`, the Connect
+server interceptor) serves the request in that run: `currentRunId()` returns it
+and the request's lines carry `run_id`. It accepts exactly one `fc.run_id`
+entry in the request, without properties, shaped like a trace id (32 lowercase
+hex, not all zero), and always removes the raw entry from the baggage. Outside
+a run nothing named `fc.run_id` is sent, whatever the baggage holds: the
+context key is the only source, so a hand-set `fc.run_id` baggage entry is
+replaced or dropped. A service on NodeSDK passes
+`fcTextMapPropagator(isAllowed)` as its `textMapPropagator`.
 
 The OpenTelemetry SDK and Connect are **optional peer dependencies**; a service
 that uses `server/tracing` or `server/connect` installs them:

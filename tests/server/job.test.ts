@@ -11,6 +11,7 @@ import {
   SpanKind,
   SpanStatusCode,
   context,
+  propagation,
   trace,
   type TracerProvider,
 } from '@opentelemetry/api';
@@ -25,7 +26,7 @@ import {
   runJob,
   withTraceparent,
 } from '../../src/server/job';
-import { startTracing, type Tracing } from '../../src/server/tracing';
+import { startTracing, withPropagationTarget, type Tracing } from '../../src/server/tracing';
 import { SPAN_ID, TRACEPARENT, TRACE_ID, captureSink, expectValidLine } from './helpers';
 
 let tracing: Tracing | undefined;
@@ -727,5 +728,63 @@ describe('traceparent helpers for queues', () => {
     const unsampled = `00-${TRACE_ID}-${SPAN_ID}-00`;
     const flags = withTraceparent(unsampled, () => trace.getActiveSpan()?.spanContext().traceFlags);
     expect(flags).toBe(0);
+  });
+});
+
+describe('run_id across a process boundary: the global propagator carries it as baggage fc.run_id', () => {
+  const SCRAPER = 'http://scraper.fc.svc.cluster.local:3050/ingest/scrape';
+  const RUN_ID = 'c'.repeat(32);
+
+  /** What a client in the active context sends to `target`. */
+  function send(target = SCRAPER): Record<string, string> {
+    const carrier: Record<string, string> = {};
+    propagation.inject(withPropagationTarget(context.active(), target), carrier);
+    return carrier;
+  }
+
+  it('receives a valid fc.run_id as the run: currentRunId() returns it', () => {
+    const received = propagation.extract(ROOT_CONTEXT, { baggage: `fc.run_id=${RUN_ID}` });
+    expect(context.with(received, currentRunId)).toBe(RUN_ID);
+    expect(propagation.getBaggage(received)?.getEntry('fc.run_id')).toBeUndefined();
+  });
+
+  it('round trip: runJob -> item -> send -> receive in a fresh context gives the run id, on the item trace', async () => {
+    const { logger, parsed } = jobLogger();
+    const sent: Array<Record<string, string>> = [];
+    const runId = await runJob('ingest-crawler', async (run) => {
+      await run.item(() => {
+        sent.push(send());
+      });
+      return run.runId;
+    }, { logger });
+
+    const [carrier] = sent;
+    expect(carrier.baggage).toBe(`fc.run_id=${runId}`);
+    // The receiving process starts from nothing but the headers.
+    const received = propagation.extract(ROOT_CONTEXT, carrier);
+    expect(context.with(received, currentRunId)).toBe(runId);
+    context.with(received, () => logger.info({ event: 'app.served' }, 'scraper served it'));
+    const served = parsed().find((line) => line.event === 'app.served') as Record<string, unknown>;
+    expect(served.run_id).toBe(runId);
+    expect(served.trace_id).toBe(carrier.traceparent.split('-')[1]);
+    expect(served.trace_id).not.toBe(runId);
+    expectValidLine(served);
+  });
+
+  it('sends no fc.run_id outside a run, even when the inbound request named one that was rejected', () => {
+    const received = propagation.extract(ROOT_CONTEXT, { baggage: 'fc.run_id=run-1,tenant=fc' });
+    expect(context.with(received, currentRunId)).toBeUndefined();
+    expect(context.with(received, () => send())).toEqual({ baggage: 'tenant=fc' });
+    expect(send()).toEqual({});
+  });
+
+  it("withTraceparent still ignores the caller's run, even one received over the wire", () => {
+    const received = propagation.extract(ROOT_CONTEXT, { baggage: `fc.run_id=${RUN_ID}` });
+    const runs = context.with(received, () => [
+      currentRunId(),
+      withTraceparent(TRACEPARENT, () => currentRunId()),
+      withTraceparent(TRACEPARENT, () => currentRunId(), { runId: 'd'.repeat(32) }),
+    ]);
+    expect(runs).toEqual([RUN_ID, undefined, 'd'.repeat(32)]);
   });
 });
