@@ -126,6 +126,18 @@ describe('httpLogMiddleware', () => {
     expect(span.attributes).toMatchObject({ 'http.request.method': 'POST', 'http.response.status_code': 202 });
   });
 
+  it("serves a request in the caller's run: baggage fc.run_id becomes run_id on http.in, a bad one is dropped", async () => {
+    const run = 'c'.repeat(32);
+    const { server, lines } = app();
+    await request(server).post('/ingest/scrape').set('traceparent', TRACEPARENT).set('baggage', `fc.run_id=${run}`).send({}).expect(202);
+    await request(server).post('/ingest/scrape').set('traceparent', TRACEPARENT).set('baggage', 'fc.run_id=RUN-1').send({}).expect(202);
+    const [good, bad] = lines();
+    expect(good).toMatchObject({ event: 'http.in', trace_id: TRACE_ID, run_id: run });
+    expectValidLine(good);
+    expect(bad).toMatchObject({ event: 'http.in', trace_id: TRACE_ID });
+    expect(bad).not.toHaveProperty('run_id');
+  });
+
   it('logs an unmatched route without its path, at warn', async () => {
     const { server, lines } = app();
     await request(server).get('/no/such/thing?x=1').expect(404);

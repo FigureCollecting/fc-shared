@@ -103,6 +103,9 @@ export const SERVER_SUBPATHS: readonly SubpathSpec[] = [
       'RedactingSpanExporter',
       'AllowlistPropagator',
       'DEFAULT_PROPAGATION_HOSTS',
+      'RunIdBaggagePropagator',
+      'RUN_ID_BAGGAGE_KEY',
+      'fcTextMapPropagator',
     ],
   },
   {

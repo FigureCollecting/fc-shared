@@ -7,7 +7,7 @@
  * real Connect requests and errors without a socket. The service descriptor is
  * built from a FileDescriptorProto so no codegen is needed.
  */
-import { SpanKind, SpanStatusCode, context, trace } from '@opentelemetry/api';
+import { ROOT_CONTEXT, SpanKind, SpanStatusCode, context, trace } from '@opentelemetry/api';
 import { create, createFileRegistry, type DescService } from '@bufbuild/protobuf';
 import {
   FileDescriptorProtoSchema,
@@ -26,6 +26,7 @@ import {
 import { InMemorySpanExporter, type ReadableSpan } from '@opentelemetry/sdk-trace';
 import { createLogger } from '../../src/server/log';
 import { codeName, peerFromHeader, rpcClientInterceptor, rpcServerInterceptor } from '../../src/server/connect';
+import { currentRunId, runJob } from '../../src/server/job';
 import { startTracing, type Tracing } from '../../src/server/tracing';
 import { captureSink, expectValidLine, type LogLine } from './helpers';
 
@@ -59,8 +60,10 @@ const INTERNAL = 'http://ingest-server.fc.svc:50061';
 
 interface Seen {
   traceparent: string | null;
+  baggage: string | null;
   traceId?: string;
   spanId?: string;
+  runId?: string;
 }
 
 interface EchoClient {
@@ -87,7 +90,13 @@ function setup(options: { baseUrl?: string; outer?: Interceptor[]; clientInterce
 
   const record = (ctx: HandlerContext) => {
     const active = trace.getActiveSpan()?.spanContext();
-    seen.push({ traceparent: ctx.requestHeader.get('traceparent'), traceId: active?.traceId, spanId: active?.spanId });
+    seen.push({
+      traceparent: ctx.requestHeader.get('traceparent'),
+      baggage: ctx.requestHeader.get('baggage'),
+      traceId: active?.traceId,
+      spanId: active?.spanId,
+      runId: currentRunId(),
+    });
   };
 
   const transport = createRouterTransport(
@@ -288,6 +297,44 @@ describe('rpc interceptors: propagation allowlist and span nesting', () => {
     ) as ReadableSpan;
     expect(rpcSpan.parentSpanContext?.spanId).toBe(httpSpan.spanContext().spanId);
     expect(context.active()).toBeDefined();
+  });
+});
+
+describe('rpc interceptors: the run id crosses the call as baggage fc.run_id', () => {
+  // A remote server shares no context with its caller; the in-memory transport does.
+  // Serving every call from an empty context leaves the server only the headers.
+  const freshProcess: Interceptor = (next) => (req) => context.with(ROOT_CONTEXT, () => next(req));
+  const silent = createLogger({ env: {}, sink: () => undefined });
+
+  it('a client call inside a run item reaches the server handler with that run id, and rpc.in carries it', async () => {
+    const { echo, seen, serverLines } = setup({ outer: [freshProcess] });
+    const runId = await runJob(
+      'ingest-crawler',
+      (run) =>
+        run.item(async () => {
+          await echo.echo(message('in-run'));
+          return run.runId;
+        }),
+      { logger: silent },
+    );
+    expect(seen[0].baggage).toBe(`fc.run_id=${runId}`);
+    expect(seen[0].runId).toBe(runId);
+    const inbound = only(serverLines());
+    expect(inbound.run_id).toBe(runId);
+    expectValidLine(inbound);
+  });
+
+  it('serves a call made outside any run with no run id', async () => {
+    const { echo, seen, serverLines } = setup({ outer: [freshProcess] });
+    await echo.echo(message('no-run'));
+    expect(seen[0]).toMatchObject({ baggage: null, runId: undefined });
+    expect(only(serverLines())).not.toHaveProperty('run_id');
+  });
+
+  it('sends no baggage to a target off the allowlist, even inside a run', async () => {
+    const { echo, seen } = setup({ baseUrl: 'https://api.store.example', outer: [freshProcess] });
+    await runJob('ingest-crawler', (run) => run.item(() => echo.echo(message('x'))), { logger: silent });
+    expect(seen[0]).toMatchObject({ traceparent: null, baggage: null, runId: undefined });
   });
 });
 

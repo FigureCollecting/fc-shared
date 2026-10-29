@@ -25,18 +25,24 @@
  * off-list host altogether, so such a request gets no auto span either; this
  * propagator stays as the second line for every other path.
  *
+ * The run id crosses a process boundary as the W3C baggage entry fc.run_id,
+ * bridged by RunIdBaggagePropagator INSIDE the allowlist, so it goes exactly
+ * where traceparent goes. The context key stays the only in-process truth.
+ *
  * Depends only on @opentelemetry/api, so the Connect interceptors can use it
  * without pulling in the SDK.
  */
 import {
   SpanKind,
   createContextKey,
+  propagation,
   type Context,
   type TextMapGetter,
   type TextMapPropagator,
   type TextMapSetter,
   trace,
 } from '@opentelemetry/api';
+import { runIdOf, withRunId } from './fields';
 import type { Env } from './log';
 
 /** Cluster-internal by construction. Loopback IPs are deliberately NOT listed. */
@@ -145,6 +151,75 @@ export class AllowlistPropagator implements TextMapPropagator {
 
   extract(ctx: Context, carrier: unknown, getter: TextMapGetter): Context {
     return this.delegate.extract(ctx, carrier, getter);
+  }
+
+  fields(): string[] {
+    return this.delegate.fields();
+  }
+}
+
+/** The W3C baggage entry that carries the run id from one process to the next. */
+export const RUN_ID_BAGGAGE_KEY = 'fc.run_id';
+
+/** The key of one raw baggage entry, decoded as the W3C parser decodes it; undefined when it cannot be decoded. */
+function baggageKeyOf(entry: string): string | undefined {
+  try {
+    return decodeURIComponent(entry.split(/[=;]/, 1)[0].trim());
+  } catch {
+    return undefined;
+  }
+}
+
+/** How many entries of the carrier's raw baggage header(s) name the run id. */
+function runIdEntriesIn(header: string | string[] | undefined): number {
+  const entries = (Array.isArray(header) ? header.join(',') : (header ?? '')).split(',');
+  return entries.filter((entry) => baggageKeyOf(entry) === RUN_ID_BAGGAGE_KEY).length;
+}
+
+/** `ctx` with fc.run_id as the FIRST baggage entry when it carries a run; with no fc.run_id entry when it does not. */
+function withRunIdBaggage(ctx: Context): Context {
+  const runId = runIdOf(ctx);
+  const baggage = propagation.getBaggage(ctx);
+  if (runId === undefined) {
+    return baggage?.getEntry(RUN_ID_BAGGAGE_KEY) === undefined
+      ? ctx
+      : propagation.setBaggage(ctx, baggage.removeEntry(RUN_ID_BAGGAGE_KEY));
+  }
+  // First, so the W3C injector's 180-pair and 8192-byte cuts drop other entries, never this one.
+  let bridged = propagation.createBaggage({ [RUN_ID_BAGGAGE_KEY]: { value: runId } });
+  for (const [key, entry] of baggage?.getAllEntries() ?? []) {
+    if (key !== RUN_ID_BAGGAGE_KEY) bridged = bridged.setEntry(key, entry);
+  }
+  return propagation.setBaggage(ctx, bridged);
+}
+
+/**
+ * Bridges the run-id context key and the baggage entry fc.run_id around a W3C
+ * delegate. Belongs INSIDE AllowlistPropagator (fcTextMapPropagator builds the
+ * stack), so the run id goes only where traceparent goes.
+ *   inject: the context's run, if any, as fc.run_id; any other fc.run_id entry
+ *           (a stale or forged inbound one) is never forwarded.
+ *   extract: after the delegate (W3C baggage extraction REPLACES the baggage),
+ *           exactly one fc.run_id entry in the carrier, with no properties and
+ *           a real trace id (32 lowercase hex, not all zero), becomes the run.
+ *           The raw entry is always removed from the baggage.
+ * A valid but forged value only mislabels log lines; the trust boundary is the mesh.
+ */
+export class RunIdBaggagePropagator implements TextMapPropagator {
+  constructor(private readonly delegate: TextMapPropagator) {}
+
+  inject(ctx: Context, carrier: unknown, setter: TextMapSetter): void {
+    this.delegate.inject(withRunIdBaggage(ctx), carrier, setter);
+  }
+
+  extract(ctx: Context, carrier: unknown, getter: TextMapGetter): Context {
+    const extracted = this.delegate.extract(ctx, carrier, getter);
+    const baggage = propagation.getBaggage(extracted);
+    const entry = baggage?.getEntry(RUN_ID_BAGGAGE_KEY);
+    if (baggage === undefined || entry === undefined) return extracted;
+    const stripped = propagation.setBaggage(extracted, baggage.removeEntry(RUN_ID_BAGGAGE_KEY));
+    const single = entry.metadata === undefined && runIdEntriesIn(getter.get(carrier, 'baggage')) === 1;
+    return single ? withRunId(stripped, entry.value) : stripped;
   }
 
   fields(): string[] {
