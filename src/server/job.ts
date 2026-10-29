@@ -11,12 +11,17 @@
  * spans in a single trace. Requests made inside the item carry the item's
  * traceparent (to allowlisted hosts only), so the scraper continues it.
  *
+ * Every line written in the run or in one of its items carries run_id, the
+ * run's trace id (the context key fc.run_id): run_id finds the whole run,
+ * trace_id one item. No SDK (an all-zero run trace id) means no run_id.
+ *
  * Spans are flushed before runJob returns: a CronJob process exits right after,
  * and a batch still queued would be lost. A flush failure never masks the
  * job's own result.
  *
  * currentTraceparent / withTraceparent carry a trace across a queue: store the
- * string with the queued item, restore it in the worker.
+ * string with the queued item, restore it in the worker. currentRunId, stored
+ * next to it and handed back as withTraceparent's runId, carries the run too.
  *
  * Depends only on @opentelemetry/api.
  */
@@ -35,7 +40,7 @@ import {
   type Tracer,
 } from '@opentelemetry/api';
 import { createLogger, type Env, type Logger } from './log';
-import { elapsedMs } from './fields';
+import { elapsedMs, runIdOf, withRunId } from './fields';
 
 export const TRACER_NAME = 'fc-shared/job';
 
@@ -77,7 +82,7 @@ export function itemContext(run: JobRun, options: ItemOptions = {}): { context: 
     },
     ROOT_CONTEXT,
   );
-  return { context: trace.setSpan(ROOT_CONTEXT, span), span };
+  return { context: trace.setSpan(withRunId(ROOT_CONTEXT, runContext.traceId), span), span };
 }
 
 async function runItem<T>(run: JobRun, fn: () => T | Promise<T>, options?: ItemOptions): Promise<T> {
@@ -123,10 +128,11 @@ export async function runJob<T>(
     },
     ROOT_CONTEXT,
   );
-  const runContext = trace.setSpan(ROOT_CONTEXT, span);
+  const runId = span.spanContext().traceId;
+  const runContext = trace.setSpan(withRunId(ROOT_CONTEXT, runId), span);
   const run: JobRun = {
     name,
-    runId: span.spanContext().traceId,
+    runId,
     span,
     tracer,
     item: (itemFn, itemOptions) => runItem(run, itemFn, itemOptions),
@@ -164,6 +170,11 @@ export function currentTraceparent(): string | undefined {
   return `00-${spanContext.traceId}-${spanContext.spanId}-${flags}`;
 }
 
+/** The active run's id (runJob, run.item, itemContext, withTraceparent), to store with a queued item's traceparent. */
+export function currentRunId(): string | undefined {
+  return runIdOf(context.active());
+}
+
 const TRACEPARENT = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/;
 
 /** A version-00 traceparent as a remote span context; undefined if malformed or zero. */
@@ -179,12 +190,29 @@ export function parseTraceparent(value: string | null | undefined): SpanContext 
   return isSpanContextValid(spanContext) ? spanContext : undefined;
 }
 
+export interface TraceparentOptions {
+  /**
+   * The run the stored item belongs to (currentRunId() at enqueue), printed as run_id. Without one that is a real
+   * trace id, fn runs in no run.
+   */
+  runId?: string | null;
+}
+
 /**
  * Run fn with a stored traceparent as its parent, so a worker's spans and log
  * lines continue the enqueuer's trace. A missing or malformed value runs fn
- * with no parent at all rather than a broken one.
+ * with no parent at all rather than a broken one. The run comes only from
+ * what was stored, like the trace: options.runId when that is a real trace id
+ * (kept even when the traceparent is bad), else none, never the call site's.
+ * A stored value of the wrong type (a queue payload is JSON) counts as none.
  */
-export function withTraceparent<T>(traceparent: string | null | undefined, fn: () => T): T {
+export function withTraceparent<T>(
+  traceparent: string | null | undefined,
+  fn: () => T,
+  options?: TraceparentOptions,
+): T {
   const parent = parseTraceparent(traceparent);
-  return context.with(parent === undefined ? ROOT_CONTEXT : trace.setSpanContext(ROOT_CONTEXT, parent), fn);
+  const stored: unknown = options?.runId;
+  const run = withRunId(ROOT_CONTEXT, typeof stored === 'string' ? stored.trim() : undefined);
+  return context.with(parent === undefined ? run : trace.setSpanContext(run, parent), fn);
 }

@@ -109,4 +109,8 @@ describe('package.json exports map: node-only server subpaths (1.8.0)', () => {
   it('is at or beyond 1.8.0, the additive minor that added the server subpaths', () => {
     expect(atLeast(pkg.version, '1.8.0')).toBe(true);
   });
+
+  it('is at or beyond 1.9.0, the additive minor that added run_id and currentRunId', () => {
+    expect(atLeast(pkg.version, '1.9.0')).toBe(true);
+  });
 });

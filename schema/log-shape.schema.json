@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/FigureCollecting/fc-shared/schema/log-shape.schema.json",
   "title": "FigureCollecting log line",
-  "description": "One JSON object per stdout line (lg-logging plan, log_shape). Reserved keys are typed; any other key is lowercase snake_case with a scalar value. trace_id/span_id are present only under an active span and are never zeroed.",
+  "description": "One JSON object per stdout line (lg-logging plan, log_shape). Reserved keys are typed; any other key is lowercase snake_case with a scalar value. trace_id/span_id are present only under an active span and are never zeroed; run_id only inside a run.",
   "type": "object",
   "required": ["time", "level", "service", "version", "event", "msg"],
   "properties": {
@@ -45,7 +45,12 @@
       },
       "additionalProperties": false
     },
-    "queue_ms": { "description": "Time waiting in a queue, kept apart from duration_ms.", "type": "number", "minimum": 0 }
+    "queue_ms": { "description": "Time waiting in a queue, kept apart from duration_ms.", "type": "number", "minimum": 0 },
+    "run_id": {
+      "description": "The run a line belongs to: its server/job run's trace id, on every line of the run and of its items; absent outside a run. A caller's own run_id wins.",
+      "type": "string",
+      "minLength": 1
+    }
   },
   "propertyNames": { "pattern": "^[a-z][a-z0-9_]*$" },
   "additionalProperties": { "type": ["string", "number", "boolean", "null"] },

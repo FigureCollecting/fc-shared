@@ -3,18 +3,22 @@
  * log_shape). One JSON object per stdout line, never multi-line:
  *
  *   time level service version event msg call code duration_ms peer
- *   trace_id span_id job err queue_ms, then the event's own fields
+ *   trace_id span_id job err queue_ms run_id, then the event's own fields
  *
  * RESERVED keys are typed and always in that order. trace_id/span_id come only
- * from the ACTIVE span and are absent (never zeroed) without one. Every other
- * key is normalised to lowercase snake_case with a flat scalar value: strings
- * are redacted by fc-shared's policy and made log-injection safe
+ * from the ACTIVE span and are absent (never zeroed) without one. run_id (1.9.0,
+ * last so every earlier key keeps its place) is the run's trace id on every
+ * line of a server/job run and its items, read from the context key fc.run_id;
+ * absent outside a run; a caller's own run_id wins, in the same place.
+ * Every other key is normalised to lowercase snake_case with a flat scalar
+ * value: strings are redacted by fc-shared's policy and made log-injection safe
  * (sanitizeLogValue: no newlines, 1000-char cap); objects become one-line JSON.
  *
  * Every value the logger prints (msg and its parts, err.type and
  * err.message, each extra field and object key, the reserved call, code,
- * peer, job and event, bridged and printf console arguments, and an Error's
- * message wherever it appears, its stack included) goes through one policy: a
+ * peer, job, event and a caller's run_id, bridged and printf console
+ * arguments, and an Error's message wherever it appears, its stack included)
+ * goes through one policy: a
  * URL loses its query, fragment and userinfo; a value under a URL-named key
  * (url, href, path ...) is cut at its first ? or #; a sensitive header line,
  * header-list entry or form-encoded value is masked; a string that is a whole
@@ -37,7 +41,7 @@
 import { ClientRequest, IncomingMessage, ServerResponse } from 'node:http';
 import { Stream } from 'node:stream';
 import { formatWithOptions } from 'node:util';
-import { isSpanContextValid, trace } from '@opentelemetry/api';
+import { context, isSpanContextValid, trace } from '@opentelemetry/api';
 import { sanitizeLogValue } from '../utils/logger';
 import {
   DEFAULT_SENSITIVE_KEY_PATTERN,
@@ -45,7 +49,7 @@ import {
   redactValue,
   type RedactOptions,
 } from '../utils/sanitize';
-import { roundMs } from './fields';
+import { roundMs, runIdOf } from './fields';
 
 export const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal'] as const;
 export type LogLevel = (typeof LOG_LEVELS)[number];
@@ -53,16 +57,16 @@ export type LevelSetting = LogLevel | 'silent';
 export type LogFormat = 'json' | 'text';
 export type Env = Record<string, string | undefined>;
 
-/** Reserved keys, in the order every line writes them. */
+/** Reserved keys, in the order every line writes them. run_id (1.9.0) comes last so no earlier key moves. */
 export const RESERVED_LOG_KEYS = [
   'time', 'level', 'service', 'version', 'event', 'msg', 'call', 'code', 'duration_ms',
-  'peer', 'trace_id', 'span_id', 'job', 'err', 'queue_ms',
+  'peer', 'trace_id', 'span_id', 'job', 'err', 'queue_ms', 'run_id',
 ] as const;
 
 /** Keys the logger owns; a caller-supplied value for one of them is dropped. */
 const OWNED = new Set(['time', 'level', 'service', 'version', 'msg', 'trace_id', 'span_id']);
 /** Reserved keys a caller sets through the merge object; each is typed on the way out. */
-const CALLER_RESERVED = new Set(['event', 'call', 'code', 'duration_ms', 'peer', 'job', 'err', 'queue_ms']);
+const CALLER_RESERVED = new Set(['event', 'call', 'code', 'duration_ms', 'peer', 'job', 'err', 'queue_ms', 'run_id']);
 /**
  * The shape's code as the library writes it: ok, runJob's error, a Connect code name (connect.ts codeName) or an HTTP
  * status. Any other string under the call's own code prints as the placeholder; a number prints.
@@ -752,6 +756,11 @@ function buildEntry(
   if (reserved['err'] !== undefined) entry['err'] = errField(reserved['err'], core.redact);
   const queued = nonNegativeMs(reserved['queue_ms']);
   if (queued !== undefined) entry['queue_ms'] = queued;
+  // A caller's run_id (a string or number, as text) wins; a blank or other value is none: the active run's id prints.
+  const own = reserved['run_id'];
+  const ownRun = typeof own === 'string' || typeof own === 'number' ? reservedText(own, core.redact).trim() : '';
+  const runId = ownRun === '' ? runIdOf(context.active()) : ownRun;
+  if (runId !== undefined) entry['run_id'] = runId;
 
   return Object.assign(entry, extras);
 }
