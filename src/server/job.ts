@@ -177,9 +177,9 @@ export function currentRunId(): string | undefined {
 
 const TRACEPARENT = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/;
 
-/** A version-00 traceparent as a remote span context; undefined if malformed or zero. */
+/** A version-00 traceparent as a remote span context; undefined if not a string, malformed or zero. */
 export function parseTraceparent(value: string | null | undefined): SpanContext | undefined {
-  const match = TRACEPARENT.exec(value?.trim() ?? '');
+  const match = typeof value === 'string' ? TRACEPARENT.exec(value.trim()) : null;
   if (match === null) return undefined;
   const spanContext: SpanContext = {
     traceId: match[1],
