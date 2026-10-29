@@ -17,7 +17,14 @@ import {
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { InMemorySpanExporter, type ReadableSpan } from '@opentelemetry/sdk-trace';
 import { createLogger } from '../../src/server/log';
-import { currentRunId, currentTraceparent, itemContext, runJob, withTraceparent } from '../../src/server/job';
+import {
+  currentRunId,
+  currentTraceparent,
+  itemContext,
+  parseTraceparent,
+  runJob,
+  withTraceparent,
+} from '../../src/server/job';
 import { startTracing, type Tracing } from '../../src/server/tracing';
 import { SPAN_ID, TRACEPARENT, TRACE_ID, captureSink, expectValidLine } from './helpers';
 
@@ -36,6 +43,16 @@ afterEach(async () => {
   await tracing?.shutdown();
   tracing = undefined;
 });
+
+/** Where a traceparent string belongs, a JSON queue payload (or a JavaScript caller) can hand back any of these. */
+const NOT_A_STRING: Array<[string, unknown]> = [
+  ['a number', 42],
+  ['an object', { traceparent: TRACEPARENT }],
+  ['an array', [TRACEPARENT]],
+  ['a boolean', true],
+  ['a bigint', 42n],
+  ['a symbol', Symbol(TRACEPARENT)],
+];
 
 function jobLogger(env: Record<string, string> = { JOB_NAME: 'ingest-crawler-29312345' }) {
   const capture = captureSink();
@@ -585,6 +602,24 @@ describe('run_id across a queue: withTraceparent(traceparent, fn, { runId })', (
     expect(line).not.toHaveProperty('run_id');
   });
 
+  it.each(NOT_A_STRING)(
+    'runs fn with no parent when the stored traceparent is %s, and still restores the stored runId',
+    async (_label, value) => {
+      const { logger, parsed } = jobLogger();
+      // Inside a run, under its active span: neither the call site's trace nor its run may leak in.
+      const seen = await runJob('ingest-crawler', () =>
+        withTraceparent(value as string, () => {
+          logger.info({ event: 'app.worker' }, 'w');
+          return { span: trace.getActiveSpan(), runId: currentRunId() };
+        }, { runId: RUN_ID }),
+      { logger });
+      expect(seen).toEqual({ span: undefined, runId: RUN_ID });
+      const line = parsed().find((l) => l.event === 'app.worker') as Record<string, unknown>;
+      expect(line.run_id).toBe(RUN_ID);
+      expect(line).not.toHaveProperty('trace_id');
+    },
+  );
+
   it('treats options passed as null (a JavaScript caller) as no options', () => {
     const { logger, parsed } = jobLogger();
     const untyped = withTraceparent as unknown as (traceparent: string, fn: () => void, options: null) => void;
@@ -659,6 +694,33 @@ describe('traceparent helpers for queues', () => {
       withTraceparent(value as string | null | undefined, () => trace.getActiveSpan()),
     );
     expect(seen).toBeUndefined();
+  });
+
+  it.each(NOT_A_STRING)('parseTraceparent of %s is undefined rather than a TypeError', (_label, value) => {
+    expect(parseTraceparent(value as string)).toBeUndefined();
+  });
+
+  it.each([
+    ['a valid', TRACEPARENT, 1],
+    ['a padded', ` ${TRACEPARENT}\n`, 1],
+    ['an unsampled', `00-${TRACE_ID}-${SPAN_ID}-00`, 0],
+  ])('parseTraceparent of %s string is the stored remote span context', (_label, value, traceFlags) => {
+    expect(parseTraceparent(value)).toEqual({ traceId: TRACE_ID, spanId: SPAN_ID, traceFlags, isRemote: true });
+  });
+
+  it.each([
+    [undefined],
+    [null],
+    [''],
+    ['   '],
+    ['garbage'],
+    [`00-${TRACE_ID}-${SPAN_ID}`],
+    [`ff-${TRACE_ID}-${SPAN_ID}-01`],
+    [`00-${TRACE_ID.toUpperCase()}-${SPAN_ID}-01`],
+    [`00-${'0'.repeat(32)}-${SPAN_ID}-01`],
+    [`00-${TRACE_ID}-${'0'.repeat(16)}-01`],
+  ])('parseTraceparent(%p) is undefined: missing, malformed or an all-zero id', (value) => {
+    expect(parseTraceparent(value)).toBeUndefined();
   });
 
   it('keeps the sampled flag from the stored traceparent', () => {
