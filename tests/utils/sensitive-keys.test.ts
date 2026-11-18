@@ -26,8 +26,8 @@ const sensitive = (key: string): boolean =>
   (redactValue({ [key]: 'hunter2' }) as Record<string, unknown>)[key] === '[REDACTED]';
 
 /** The corpus of the differential test: every fixture key x 9 prefixes x 8 suffixes x 4 casings, and how many differ. */
-const CORPUS_KEYS = 54432;
-const CORPUS_DISTINCT_KEYS = 29692;
+const CORPUS_KEYS = 55296;
+const CORPUS_DISTINCT_KEYS = 30259;
 
 const LOWER = /[a-z]/;
 const UPPER = /[A-Z]/;
