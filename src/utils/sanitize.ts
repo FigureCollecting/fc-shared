@@ -24,9 +24,18 @@
  * legitimate ids/hashes — low.
  */
 
-/** Field-name patterns whose VALUE is always redacted regardless of content. */
+/**
+ * Field-name patterns whose VALUE is always redacted regardless of content.
+ *
+ * 'otp' counts only at an edge of a word of the key: where it (or totp) starts
+ * the key or follows a non-letter (otp, otp_code, otpCode, totpCode, x-otp), or
+ * where it ends the key or precedes a non-letter (userOtp, user_totp, hotp,
+ * mfa.otp). With a letter on both sides it is the middle of another word
+ * (footprint, rootPath, screenshotPath). The pattern is case-insensitive, so it
+ * cannot tell the hump of userOtpCode from footprint: both are kept.
+ */
 export const DEFAULT_SENSITIVE_KEY_PATTERN =
-  /pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|authorization|credential|cookie|session[-_]?id|bearer|otp|passphrase|\bpin\b|\bssn\b|\bmfa\b/i;
+  /pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|authorization|credential|cookie|session[-_]?id|bearer|(?:^|[^a-z])t?otp|otp(?:$|[^a-z])|passphrase|\bpin\b|\bssn\b|\bmfa\b/i;
 
 /** Well-known secret SHAPES masked wherever they appear inside a string value. */
 export const DEFAULT_SECRET_VALUE_PATTERNS: readonly RegExp[] = [
