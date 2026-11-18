@@ -139,6 +139,12 @@ describe('the otp key is anchored to a word of the key', () => {
       log.info('userOtpNumber: 654321');
     }
     expect(capture.parsed().map((line) => line.msg)).toEqual(Array(3).fill('userOtpNumber: [REDACTED]'));
+    // A line reads its header names more than once, so the calls that miss differ by shape: an error's message is one.
+    for (let call = 0; call < 3; call += 1) log.error({ err: new Error('userOtpNumber: 654322') });
+    expect(capture.parsed().slice(3).map((line) => (line.err as { message: string }).message)).toEqual(
+      Array(3).fill('userOtpNumber: [REDACTED]'),
+    );
+    expect(capture.lines.join('\n')).not.toMatch(/65432[12]/);
   });
 
   it('prints a footprint field of a server log line, and masks its otp fields', () => {
