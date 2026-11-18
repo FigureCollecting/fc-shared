@@ -27,15 +27,24 @@
 /**
  * Field-name patterns whose VALUE is always redacted regardless of content.
  *
- * 'otp' counts only at an edge of a word of the key: where it (or totp) starts
- * the key or follows a non-letter (otp, otp_code, otpCode, totpCode, x-otp), or
- * where it ends the key or precedes a non-letter (userOtp, user_totp, hotp,
- * mfa.otp). With a letter on both sides it is the middle of another word
- * (footprint, rootPath, screenshotPath). The pattern is case-insensitive, so it
- * cannot tell the hump of userOtpCode from footprint: both are kept.
+ * 'otp' counts only at an edge of a word of the key: where it (or totp, hotp)
+ * starts the key or follows a non-letter (otp, otp_code, otpCode, totpCode,
+ * x-otp), or where it ends the key or precedes a non-letter (userOtp,
+ * user_totp, mfa.otp). With a letter on both sides it is the middle of another
+ * word (footprint, rootPath, screenshotPath) unless the key's case shows a
+ * word starting there: {@link DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN}.
  */
 export const DEFAULT_SENSITIVE_KEY_PATTERN =
-  /pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|authorization|credential|cookie|session[-_]?id|bearer|(?:^|[^a-z])t?otp|otp(?:$|[^a-z])|passphrase|\bpin\b|\bssn\b|\bmfa\b/i;
+  /pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|authorization|credential|cookie|session[-_]?id|bearer|(?:^|[^a-z])[ht]?otp|otp(?:$|[^a-z])|passphrase|\bpin\b|\bssn\b|\bmfa\b/i;
+
+/**
+ * Case-SENSITIVE field-name patterns, tested as well as the pattern above: a
+ * camelCase word that only the key's case shows. Otp, Totp and Hotp anywhere
+ * (userOtpCode, smsOtpValue, userHotpCounter), and OTP, TOTP or HOTP after a
+ * lower-case letter (userOTPCode; after a digit the pattern above matches).
+ * footprint, FOOTPRINT and rootPath hold none of them.
+ */
+export const DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN = /Otp|Totp|Hotp|[a-z][TH]?OTP/;
 
 /** Well-known secret SHAPES masked wherever they appear inside a string value. */
 export const DEFAULT_SECRET_VALUE_PATTERNS: readonly RegExp[] = [
@@ -52,6 +61,12 @@ export const DEFAULT_SECRET_VALUE_PATTERNS: readonly RegExp[] = [
 export interface RedactOptions {
   /** Field-name matcher; defaults to {@link DEFAULT_SENSITIVE_KEY_PATTERN}. */
   sensitiveKeyPattern?: RegExp;
+  /**
+   * Case-sensitive field-name matcher, tested as well as sensitiveKeyPattern
+   * (a custom sensitiveKeyPattern does not replace it); defaults to
+   * {@link DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN}.
+   */
+  sensitiveCamelKeyPattern?: RegExp;
   /** Value-shape matchers; defaults to {@link DEFAULT_SECRET_VALUE_PATTERNS}. */
   secretValuePatterns?: readonly RegExp[];
   /** Replacement text for redacted values. Default '[REDACTED]'. */
@@ -64,16 +79,19 @@ export interface RedactOptions {
 
 const DEFAULTS: Required<RedactOptions> = {
   sensitiveKeyPattern: DEFAULT_SENSITIVE_KEY_PATTERN,
+  sensitiveCamelKeyPattern: DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN,
   secretValuePatterns: DEFAULT_SECRET_VALUE_PATTERNS,
   placeholder: '[REDACTED]',
   maxStringLength: 8192,
   maxDepth: 12,
 };
 
-function isSensitiveKey(key: string, pattern: RegExp): boolean {
+function isSensitiveKey(key: string, opts: Required<RedactOptions>): boolean {
   // Reset lastIndex so a stateful /g pattern can't desync across calls.
-  pattern.lastIndex = 0;
-  return pattern.test(key);
+  opts.sensitiveKeyPattern.lastIndex = 0;
+  if (opts.sensitiveKeyPattern.test(key)) return true;
+  opts.sensitiveCamelKeyPattern.lastIndex = 0;
+  return opts.sensitiveCamelKeyPattern.test(key);
 }
 
 /**
@@ -146,7 +164,7 @@ function walk(
     seen.add(obj);
     const out: Record<string, unknown> = {};
     for (const key of Object.keys(obj)) {
-      out[key] = isSensitiveKey(key, opts.sensitiveKeyPattern)
+      out[key] = isSensitiveKey(key, opts)
         ? opts.placeholder
         : walk(obj[key], opts, depth + 1, seen);
     }
@@ -186,7 +204,7 @@ export function redactAttributes(
   const out: Record<string, AttributeValue> = {};
   for (const key of Object.keys(attributes)) {
     const val = attributes[key];
-    if (isSensitiveKey(key, opts.sensitiveKeyPattern)) {
+    if (isSensitiveKey(key, opts)) {
       out[key] = opts.placeholder;
       continue;
     }
