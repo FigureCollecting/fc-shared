@@ -25,13 +25,25 @@ const BEFORE_WITHOUT_OTP = new RegExp(BEFORE.source.replace('|otp|', '|'), 'i');
 const sensitive = (key: string): boolean =>
   (redactValue({ [key]: 'hunter2' }) as Record<string, unknown>)[key] === '[REDACTED]';
 
+/** The corpus of the differential test: every fixture key x 9 prefixes x 8 suffixes x 4 casings, and how many differ. */
+const CORPUS_KEYS = 52704;
+const CORPUS_DISTINCT_KEYS = 28556;
+
 const LOWER = /[a-z]/;
+const UPPER = /[A-Z]/;
 const LETTER = /[A-Za-z]/;
+/** The words that name a secret straight after otp, in any case and with no separator (userotpcode, USEROTPSEED). */
+const SECRET_SUFFIXES = [
+  'auth', 'code', 'key', 'secret', 'seed', 'token', 'value', 'counter',
+  'uri', 'url', 'pin', 'digits', 'hash', 'b32', 'raw', 'recovery',
+];
 /**
- * The keys a mid-word otp may be released for, read one occurrence at a time: a letter on both sides, and no word
- * that the key's case shows starting there (Otp, Totp, Hotp; OTP, TOTP, HOTP after a lower-case letter or a digit).
+ * The keys a mid-word otp may be released for, read one occurrence at a time: a letter on both sides; no word that
+ * the key's case shows starting there (Otp, Totp, Hotp; OTP, TOTP, HOTP after a lower-case letter or a digit); no
+ * word that the key's case shows ending there (otp before a capital; OTP before a capitalised word); and no secret
+ * suffix straight after it.
  */
-function everyOtpIsMidWordWithoutAHump(key: string): boolean {
+function everyOtpIsMidWordWithNoWordEdge(key: string): boolean {
   for (const found of key.matchAll(/otp/gi)) {
     const at = found.index;
     const before = key[at - 1] ?? '';
@@ -40,10 +52,14 @@ function everyOtpIsMidWordWithoutAHump(key: string): boolean {
     const word = found[0];
     if (word === 'Otp') return false;
     if (word === 'otp' && (before === 'T' || before === 'H')) return false;
+    if (word === 'otp' && UPPER.test(after)) return false;
     if (word === 'OTP') {
       const lead = before === 'T' || before === 'H' ? (key[at - 2] ?? '') : before;
       if (LOWER.test(lead) || /[0-9]/.test(lead)) return false;
+      if (UPPER.test(after) && LOWER.test(key[at + 4] ?? '')) return false;
     }
+    const rest = key.slice(at + 3).toLowerCase();
+    if (SECRET_SUFFIXES.some((suffix) => rest.startsWith(suffix))) return false;
   }
   return true;
 }
@@ -67,6 +83,62 @@ describe('the otp key is anchored to a word of the key', () => {
     const masked = Object.fromEntries(Object.keys(fields).map((key) => [key, '[REDACTED]']));
     expect(redactValue(fields)).toEqual(masked);
     expect(redactAttributes(fields)).toEqual(masked);
+  });
+
+  it('still redacts a key whose case shows where the otp word ends', () => {
+    const fields = { MFAOTPCode: '1', SMSOTPCode: '2', MFATOTPSeed: '3', userotpCode: '4', smsotpValue: '5', MFAOTPNumber: '6', userotpNumber: '7' };
+    const masked = Object.fromEntries(Object.keys(fields).map((key) => [key, '[REDACTED]']));
+    expect(redactValue(fields)).toEqual(masked);
+    expect(redactAttributes(fields)).toEqual(masked);
+  });
+
+  it('still redacts a single-case key that names a secret straight after otp', () => {
+    const fields = { userotpcode: '1', USEROTPCODE: '2', smsotpvalue: '3', MFAOTPCODE: '4', userotpauthurl: '5', userOtPCode: '6' };
+    const masked = Object.fromEntries(Object.keys(fields).map((key) => [key, '[REDACTED]']));
+    expect(redactValue(fields)).toEqual(masked);
+    expect(redactAttributes(fields)).toEqual(masked);
+  });
+
+  it.each(SECRET_SUFFIXES)('redacts otp%s in lower and in upper case, as before', (suffix) => {
+    for (const key of [`userotp${suffix}`, `USEROTP${suffix.toUpperCase()}`, `smstotp${suffix}s`]) {
+      expect(BEFORE.test(key)).toBe(true);
+      expect(sensitive(key)).toBe(true);
+      expect(redactAttributes({ [key]: 'hunter2' })).toEqual({ [key]: '[REDACTED]' });
+    }
+  });
+
+  it('masks a camelCase or acronym otp key in the text of a server log line', () => {
+    const capture = captureSink();
+    const log = createLogger({ service: 'media-manager', version: '1.0.0', env: {}, sink: capture.sink });
+    log.info('smsOtpValue: 123456');
+    log.info('MFAOTPCode: 123457');
+    // Only the case-sensitive pattern knows these three.
+    log.info('header lines\nuserOtpNumber: 654321\nMFAOTPNumber: 654322\nuserotpNumber: 654323\nfootprint: 0.42');
+    log.info({ raw: ['userOtpNumber', '654324', 'rootPath', '/srv'], form: 'userOtpNumber=654325&footprint=1' });
+    const out = capture.parsed();
+    expect(out[0].msg).toBe('smsOtpValue: [REDACTED]');
+    expect(out[1].msg).toBe('MFAOTPCode: [REDACTED]');
+    expect(out[2].msg).toBe(
+      'header lines userOtpNumber: [REDACTED] MFAOTPNumber: [REDACTED] userotpNumber: [REDACTED] footprint: 0.42',
+    );
+    expect(out[3]).toMatchObject({
+      raw: '["userOtpNumber","[REDACTED]","rootPath","/srv"]',
+      form: 'userOtpNumber=[REDACTED]&footprint=1',
+    });
+    expect(capture.lines.join('\n')).not.toMatch(/12345[67]|65432[1-5]/);
+  });
+
+  it('gives the same answer on every call when the camelCase pattern is global (/g)', () => {
+    // A /g pattern keeps lastIndex after a match: tested again without a reset, it misses every second time.
+    const options = { sensitiveCamelKeyPattern: new RegExp(DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN.source, 'g') };
+    const capture = captureSink();
+    const log = createLogger({ service: 'media-manager', version: '1.0.0', env: {}, sink: capture.sink, redact: options });
+    for (let call = 0; call < 3; call += 1) {
+      expect(redactValue({ userOtpNumber: 'hunter2' }, options)).toEqual({ userOtpNumber: '[REDACTED]' });
+      expect(redactAttributes({ userOtpNumber: 'hunter2' }, options)).toEqual({ userOtpNumber: '[REDACTED]' });
+      log.info('userOtpNumber: 654321');
+    }
+    expect(capture.parsed().map((line) => line.msg)).toEqual(Array(3).fill('userOtpNumber: [REDACTED]'));
   });
 
   it('prints a footprint field of a server log line, and masks its otp fields', () => {
@@ -98,8 +170,9 @@ describe('the otp key is anchored to a word of the key', () => {
     expect(redactAttributes({ [key]: 'visible' })).toEqual({ [key]: 'visible' });
   });
 
-  // Known limit: with a letter on both sides and no change of case, otp reads as the middle of a word whether the key
-  // is userotpcode or footprint. No pattern can tell them apart; a key written in camelCase, or with a separator, redacts.
+  // Known limit: otp with a letter on both sides, no secret suffix straight after it, and no word edge shown by case.
+  // That is a single-case key (userotpattempts, USEROTPNUMBER), an odd case mix (userOtPAttempts) and a run of
+  // acronyms (mfaSMSOTPID). A key written in camelCase, or with a separator, redacts.
   it.each(KEYS.limit)('known limit: no longer redacts %s', (key) => {
     expect(BEFORE.test(key)).toBe(true);
     expect(sensitive(key)).toBe(false);
@@ -107,9 +180,15 @@ describe('the otp key is anchored to a word of the key', () => {
 });
 
 describe('nothing but a mid-word otp is released', () => {
-  const prefixes = ['', 'x-', 'user_', 'user.', 'user', 'User', 'v2', '2'];
+  const prefixes = ['', 'x-', 'user_', 'user.', 'user', 'User', 'v2', '2', 'MFA'];
   const suffixes = ['', '_id', '-id', '.value', 'Value', 'value', '2', '_2'];
-  const cases = [(key: string) => key, (key: string) => key.toUpperCase(), (key: string) => key.toLowerCase()];
+  const cases = [
+    (key: string) => key,
+    (key: string) => key.toUpperCase(),
+    (key: string) => key.toLowerCase(),
+    // Acronym style: the otp word in capitals and a capital after it (userotpcode as userOTPCode, MFAOTPCode).
+    (key: string) => key.replace(/[th]?otp[a-z]?/gi, (word) => word.toUpperCase()),
+  ];
   const corpus = [...KEYS.redact, ...KEYS.keep, ...KEYS.released, ...KEYS.limit].flatMap((key) =>
     prefixes.flatMap((prefix) => suffixes.flatMap((suffix) => cases.map((recase) => recase(prefix + key + suffix)))),
   );
@@ -124,10 +203,12 @@ describe('nothing but a mid-word otp is released', () => {
       if (after && !before) widened.push(key);
       if (before && !after) {
         released += 1;
-        if (BEFORE_WITHOUT_OTP.test(key) || !everyOtpIsMidWordWithoutAHump(key)) wronglyReleased.push(key);
+        if (BEFORE_WITHOUT_OTP.test(key) || !everyOtpIsMidWordWithNoWordEdge(key)) wronglyReleased.push(key);
       }
     }
-    expect(corpus.length).toBeGreaterThan(20000);
+    // The same two counts are pinned in media-manager's test: both repos read the same corpus.
+    expect(corpus.length).toBe(CORPUS_KEYS);
+    expect(new Set(corpus).size).toBe(CORPUS_DISTINCT_KEYS);
     expect(released).toBeGreaterThan(1000);
     expect(widened).toEqual([]);
     expect(wronglyReleased).toEqual([]);
@@ -141,7 +222,9 @@ describe('nothing but a mid-word otp is released', () => {
     expect(DEFAULT_SENSITIVE_KEY_PATTERN.flags).toBe('i');
     expect(DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN.flags).toBe('');
     // media-manager's SENSITIVE_KEY ends with these words as its one case-sensitive group, and its test pins them too.
-    expect(DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN.source).toBe('Otp|Totp|Hotp|[a-z][TH]?OTP');
+    expect(DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN.source).toBe('Otp|Totp|Hotp|[a-z][TH]?OTP|otp(?=[A-Z])|OTP(?=[A-Z][a-z])');
+    // The secret suffixes are one case-insensitive alternative, in media-manager's SENSITIVE_KEY too.
+    expect(DEFAULT_SENSITIVE_KEY_PATTERN.source).toContain(`|otp(?:${SECRET_SUFFIXES.join('|')})|`);
   });
 
   it('still composes by its source, as fc-coordinator extends it, and the camelCase pattern still applies', () => {
@@ -158,15 +241,21 @@ describe('nothing but a mid-word otp is released', () => {
 
   it('takes a service-specific camelCase pattern, in redactValue and in the server logger', () => {
     const options = { sensitiveCamelKeyPattern: /Dpop/ };
-    expect(redactValue({ userDpopKey: 'a', userOtpCode: 'b', otpCode: 'c', userdpop: 'd' }, options)).toEqual({
+    expect(redactValue({ userDpopKey: 'a', userOtpNumber: 'b', otpCode: 'c', userdpop: 'd' }, options)).toEqual({
       userDpopKey: '[REDACTED]',
-      userOtpCode: 'b',
+      userOtpNumber: 'b',
       otpCode: '[REDACTED]',
       userdpop: 'd',
     });
     const capture = captureSink();
     const log = createLogger({ service: 'media-manager', version: '1.0.0', env: {}, sink: capture.sink, redact: options });
-    log.info('proof', { userDpopKey: 'a', userOtpCode: 'b', otpCode: 'c' });
-    expect(capture.parsed()[0].msg).toBe('proof {"userDpopKey":"[REDACTED]","userOtpCode":"b","otpCode":"[REDACTED]"}');
+    log.info('proof', { userDpopKey: 'a', userOtpNumber: 'b', otpCode: 'c' });
+    log.info('userDpopKey: hunter2');
+    log.info('userOtpNumber: visible');
+    expect(capture.parsed().map((line) => line.msg)).toEqual([
+      'proof {"userDpopKey":"[REDACTED]","userOtpNumber":"b","otpCode":"[REDACTED]"}',
+      'userDpopKey: [REDACTED]',
+      'userOtpNumber: visible',
+    ]);
   });
 });

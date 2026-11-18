@@ -31,20 +31,27 @@
  * starts the key or follows a non-letter (otp, otp_code, otpCode, totpCode,
  * x-otp), or where it ends the key or precedes a non-letter (userOtp,
  * user_totp, mfa.otp). With a letter on both sides it is the middle of another
- * word (footprint, rootPath, screenshotPath) unless the key's case shows a
- * word starting there: {@link DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN}.
+ * word (footprint, rootPath, screenshotPath) unless a word that names a secret
+ * follows it at once (userotpcode, USEROTPSEED, smsotpvalue), or the key's
+ * case shows a word starting or ending there:
+ * {@link DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN}.
+ *
+ * Not redacted: otp with a letter on both sides, none of those words after it
+ * and no word edge shown by case (userotpattempts, USEROTPNUMBER, mfaSMSOTPID).
  */
 export const DEFAULT_SENSITIVE_KEY_PATTERN =
-  /pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|authorization|credential|cookie|session[-_]?id|bearer|(?:^|[^a-z])[ht]?otp|otp(?:$|[^a-z])|passphrase|\bpin\b|\bssn\b|\bmfa\b/i;
+  /pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|authorization|credential|cookie|session[-_]?id|bearer|(?:^|[^a-z])[ht]?otp|otp(?:$|[^a-z])|otp(?:auth|code|key|secret|seed|token|value|counter|uri|url|pin|digits|hash|b32|raw|recovery)|passphrase|\bpin\b|\bssn\b|\bmfa\b/i;
 
 /**
  * Case-SENSITIVE field-name patterns, tested as well as the pattern above: a
- * camelCase word that only the key's case shows. Otp, Totp and Hotp anywhere
- * (userOtpCode, smsOtpValue, userHotpCounter), and OTP, TOTP or HOTP after a
- * lower-case letter (userOTPCode; after a digit the pattern above matches).
- * footprint, FOOTPRINT and rootPath hold none of them.
+ * word edge that only the key's case shows. A word starting: Otp, Totp and
+ * Hotp anywhere (userOtpCode, smsOtpValue, userHotpCounter), and OTP, TOTP or
+ * HOTP after a lower-case letter (userOTPCode; after a digit the pattern above
+ * matches). A word ending: otp before a capital (userotpCode), and OTP before
+ * a capitalised word (MFAOTPCode, SMSTOTPSeed). footprint, FOOTPRINT and
+ * rootPath hold none of them.
  */
-export const DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN = /Otp|Totp|Hotp|[a-z][TH]?OTP/;
+export const DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN = /Otp|Totp|Hotp|[a-z][TH]?OTP|otp(?=[A-Z])|OTP(?=[A-Z][a-z])/;
 
 /** Well-known secret SHAPES masked wherever they appear inside a string value. */
 export const DEFAULT_SECRET_VALUE_PATTERNS: readonly RegExp[] = [
