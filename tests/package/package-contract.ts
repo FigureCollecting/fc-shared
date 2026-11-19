@@ -59,6 +59,7 @@ export const SUBPATHS: readonly SubpathSpec[] = [
       'redactValue',
       'redactAttributes',
       'DEFAULT_SENSITIVE_KEY_PATTERN',
+      'DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN',
       'DEFAULT_SECRET_VALUE_PATTERNS',
     ],
   },

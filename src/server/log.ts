@@ -44,6 +44,7 @@ import { formatWithOptions } from 'node:util';
 import { context, isSpanContextValid, trace } from '@opentelemetry/api';
 import { sanitizeLogValue } from '../utils/logger';
 import {
+  DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN,
   DEFAULT_SENSITIVE_KEY_PATTERN,
   redactString,
   redactValue,
@@ -205,6 +206,9 @@ function isSensitive(key: string, redact: RedactOptions, form = false): boolean 
   const pattern = redact.sensitiveKeyPattern ?? DEFAULT_SENSITIVE_KEY_PATTERN;
   pattern.lastIndex = 0;
   if (pattern.test(key)) return true;
+  const camel = redact.sensitiveCamelKeyPattern ?? DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN;
+  camel.lastIndex = 0;
+  if (camel.test(key)) return true;
   if (!SECRET_WORD_HINT.test(key)) return false;
   const snake = toSnakeCase(key);
   return QUERY_SECRET_KEY.test(snake) || (form && FORM_SECRET_KEY.test(snake));

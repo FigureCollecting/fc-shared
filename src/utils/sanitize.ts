@@ -24,9 +24,64 @@
  * legitimate ids/hashes — low.
  */
 
-/** Field-name patterns whose VALUE is always redacted regardless of content. */
-export const DEFAULT_SENSITIVE_KEY_PATTERN =
-  /pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|authorization|credential|cookie|session[-_]?id|bearer|otp|passphrase|\bpin\b|\bssn\b|\bmfa\b/i;
+/**
+ * Words after an otp (totp, hotp) word that name no secret. A key whose otp
+ * word is followed by separators and one of these, and nothing else, prints
+ * (otp_attempts, otpExpiresAt, userotpsentat); every other otp key redacts.
+ * The list is pinned by tests/fixtures/sensitive-keys.json
+ * (otpNonSecretSuffixes), which media-manager's redact.py reads too.
+ */
+const OTP_NON_SECRET_SUFFIXES = [
+  'attempts', 'count', 'enabled', 'required', 'verified', 'expires', 'expiry', 'expiresAt',
+  'sentAt', 'length', 'type', 'method', 'channel', 'status', 'lastUsed',
+];
+/**
+ * Words that run on from the p of an otp inside a single-case word, which is
+ * then no otp word: footprint, footpath, potpourri (fixture otpGuardWords).
+ */
+const OTP_GUARD_WORDS = ['path', 'pourri', 'print'];
+
+/** A word in either case, letter by letter, for the case-sensitive pattern: at -> [aA][tT]. */
+const anyCase = (word: string): string => word.replace(/[a-z]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
+/** One of the entries; an entry's words (expiresAt: expires, at) may be split by `sep`. */
+const oneOf = (entries: readonly string[], sep: string, recase: (word: string) => string): string =>
+  `(?:${entries
+    .map((entry) => entry.split(/(?=[A-Z])/).map((word) => recase(word.toLowerCase())).join(sep))
+    .join('|')})`;
+
+/**
+ * Field-name patterns whose VALUE is always redacted regardless of content.
+ *
+ * otp, totp and hotp redact where they start the key or follow a non-letter
+ * (otp, otp_code, otpCode, x-otp), or end the key or precede a non-letter
+ * (userOtp, user_totp, mfa.otp); with a letter on both sides,
+ * {@link DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN} reads the key's case. Either way
+ * the key prints when the rest of it is a non-secret word (otp_attempts).
+ */
+export const DEFAULT_SENSITIVE_KEY_PATTERN = new RegExp(
+  'pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|authorization' +
+    '|credential|cookie|session[-_]?id|bearer|(?:(?:^|[^a-z])[ht]?otp|otp(?=$|[^a-z]))' +
+    `(?![^a-z0-9]*${oneOf(OTP_NON_SECRET_SUFFIXES, '[^a-z0-9]*', (word) => word)}$)` +
+    '|passphrase|\\bpin\\b|\\bssn\\b|\\bmfa\\b',
+  'i',
+);
+
+/**
+ * Case-SENSITIVE field-name patterns, tested as well as the pattern above, for
+ * an otp with a letter on both sides. It is an otp word when the key's case
+ * starts a word there (Otp, OtP, OTp anywhere; OTP after a lower-case letter:
+ * userOtpCode, userOTPCode) or ends one (otp before a capital: userotpCode),
+ * and anywhere else (userotps, USEROTPNUMBER, MFAOTPCode, userTotpcode) unless
+ * a guard word runs on from its p (footprint, FOOTPRINT, footpath). A
+ * lower-case o with a capital inside reads as two words (rootPath,
+ * IoTPlatform, useroTpnumber): no otp word. As above, the key prints when the
+ * rest of it is a non-secret word (userOtpAttempts, USEROTPSENTAT).
+ */
+export const DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN = new RegExp(
+  '(?:Otp|[a-z]OTP|otp(?=[A-Z])|O(?:tP|Tp)' +
+    `|(?:[A-Za-z]otp(?=[a-z])|[A-Z]OTP(?=[A-Za-z]))(?!${oneOf(OTP_GUARD_WORDS.map((word) => word.slice(1)), '', anyCase)}))` +
+    `(?![^A-Za-z0-9]*${oneOf(OTP_NON_SECRET_SUFFIXES, '[^A-Za-z0-9]*', anyCase)}$)`,
+);
 
 /** Well-known secret SHAPES masked wherever they appear inside a string value. */
 export const DEFAULT_SECRET_VALUE_PATTERNS: readonly RegExp[] = [
@@ -43,6 +98,12 @@ export const DEFAULT_SECRET_VALUE_PATTERNS: readonly RegExp[] = [
 export interface RedactOptions {
   /** Field-name matcher; defaults to {@link DEFAULT_SENSITIVE_KEY_PATTERN}. */
   sensitiveKeyPattern?: RegExp;
+  /**
+   * Case-sensitive field-name matcher, tested as well as sensitiveKeyPattern
+   * (a custom sensitiveKeyPattern does not replace it); defaults to
+   * {@link DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN}.
+   */
+  sensitiveCamelKeyPattern?: RegExp;
   /** Value-shape matchers; defaults to {@link DEFAULT_SECRET_VALUE_PATTERNS}. */
   secretValuePatterns?: readonly RegExp[];
   /** Replacement text for redacted values. Default '[REDACTED]'. */
@@ -55,16 +116,19 @@ export interface RedactOptions {
 
 const DEFAULTS: Required<RedactOptions> = {
   sensitiveKeyPattern: DEFAULT_SENSITIVE_KEY_PATTERN,
+  sensitiveCamelKeyPattern: DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN,
   secretValuePatterns: DEFAULT_SECRET_VALUE_PATTERNS,
   placeholder: '[REDACTED]',
   maxStringLength: 8192,
   maxDepth: 12,
 };
 
-function isSensitiveKey(key: string, pattern: RegExp): boolean {
+function isSensitiveKey(key: string, opts: Required<RedactOptions>): boolean {
   // Reset lastIndex so a stateful /g pattern can't desync across calls.
-  pattern.lastIndex = 0;
-  return pattern.test(key);
+  opts.sensitiveKeyPattern.lastIndex = 0;
+  if (opts.sensitiveKeyPattern.test(key)) return true;
+  opts.sensitiveCamelKeyPattern.lastIndex = 0;
+  return opts.sensitiveCamelKeyPattern.test(key);
 }
 
 /**
@@ -137,7 +201,7 @@ function walk(
     seen.add(obj);
     const out: Record<string, unknown> = {};
     for (const key of Object.keys(obj)) {
-      out[key] = isSensitiveKey(key, opts.sensitiveKeyPattern)
+      out[key] = isSensitiveKey(key, opts)
         ? opts.placeholder
         : walk(obj[key], opts, depth + 1, seen);
     }
@@ -177,7 +241,7 @@ export function redactAttributes(
   const out: Record<string, AttributeValue> = {};
   for (const key of Object.keys(attributes)) {
     const val = attributes[key];
-    if (isSensitiveKey(key, opts.sensitiveKeyPattern)) {
+    if (isSensitiveKey(key, opts)) {
       out[key] = opts.placeholder;
       continue;
     }
