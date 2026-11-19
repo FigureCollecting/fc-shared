@@ -20,6 +20,8 @@ const KEYS: {
   otpNonSecretSuffixes: string[];
   otpGuardWords: string[];
   otpSecretTails: string[];
+  unicodePrints: string[];
+  unicodeRedacts: string[];
 } = JSON.parse(readFileSync(join(__dirname, '../fixtures/sensitive-keys.json'), 'utf8'));
 
 /** The pattern as fc-shared 1.10.0 shipped it: 'otp' anywhere in a key. */
@@ -33,8 +35,8 @@ const sensitive = (key: string): boolean =>
   (redactValue({ [key]: 'hunter2' }) as Record<string, unknown>)[key] === '[REDACTED]';
 
 /** The corpus of the differential test: fixture keys x 9 prefixes x 8 suffixes x 4 casings, and how many differ. */
-const CORPUS_KEYS = 69696;
-const CORPUS_DISTINCT_KEYS = 40114;
+const CORPUS_KEYS = 70848;
+const CORPUS_DISTINCT_KEYS = 40994;
 
 const LOWER = /[a-z]/;
 const UPPER = /[A-Z]/;
@@ -160,6 +162,16 @@ describe('the otp key is anchored to a word of the key', () => {
       expect(redactAttributes({ [key]: 'visible' })).toEqual({ [key]: 'visible' });
       for (const more of [`${key}s`, `${key}2`, `${key}_code`, `${key}Code`]) expect(sensitive(more)).toBe(true);
     }
+  });
+
+  // The key pattern has the i flag and no u flag, so a non-ASCII letter is a separator. With u, the long s (U+017F)
+  // would read as s and the Kelvin sign (U+212A) as k.
+  it.each(KEYS.unicodePrints)('prints %s: a non-ASCII letter is a separator between otp and a non-secret word', (key) => {
+    expect(sensitive(key)).toBe(false);
+  });
+
+  it.each(KEYS.unicodeRedacts)('redacts %s: a non-ASCII letter does not fold to an ASCII one', (key) => {
+    expect(sensitive(key)).toBe(true);
   });
 
   it('reads only the end of the key as its end, not a line break before it', () => {

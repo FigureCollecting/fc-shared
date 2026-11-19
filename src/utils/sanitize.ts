@@ -33,7 +33,7 @@
  */
 const OTP_NON_SECRET_SUFFIXES = [
   'attempts', 'count', 'enabled', 'required', 'verified', 'expires', 'expiry', 'expiresAt',
-  'sent', 'sentAt', 'length', 'type', 'method', 'channel', 'status', 'lastUsed',
+  'sentAt', 'length', 'type', 'method', 'channel', 'status', 'lastUsed',
 ];
 /**
  * Words that run on from the p of an otp inside a single-case word, which is
