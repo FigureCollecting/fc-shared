@@ -33,8 +33,8 @@ const sensitive = (key: string): boolean =>
   (redactValue({ [key]: 'hunter2' }) as Record<string, unknown>)[key] === '[REDACTED]';
 
 /** The corpus of the differential test: fixture keys x 9 prefixes x 8 suffixes x 4 casings, and how many differ. */
-const CORPUS_KEYS = 67968;
-const CORPUS_DISTINCT_KEYS = 39089;
+const CORPUS_KEYS = 69120;
+const CORPUS_DISTINCT_KEYS = 39651;
 
 const LOWER = /[a-z]/;
 const UPPER = /[A-Z]/;
@@ -51,10 +51,10 @@ const GUARD_TAILS = KEYS.otpGuardWords.map((word) => word.slice(1));
 /**
  * The keys the otp rule lets print, read one otp at a time (any case). Each one prints when what follows it is
  * separators and one non-secret entry, and nothing else. Otherwise it redacts when a separator or the key's edge
- * is on either side, when its case starts a word (Otp, OtP, OTp; Totp, Hotp; OTP or TOTP after a lower-case
- * letter) or ends one (otp before a capital; OTP before a capitalised word). A lower-case o with a capital inside
- * (rootPath, IoTPlatform) is no otp word. What is left is a single-case run (footprint, USEROTPNUMBER): it
- * redacts unless a guard word runs on from the p.
+ * is on either side (totp and hotp count from their t or h), when its case starts a word (Otp, OtP, OTp; OTP after
+ * a lower-case letter) or ends one (otp before a capital). A lower-case o with a capital inside (rootPath,
+ * IoTPlatform) is no otp word. What is left (footprint, USEROTPNUMBER, MFAOTPCode) redacts unless a guard word
+ * runs on from the p.
  */
 function everyOtpPrintsByTheRule(key: string): boolean {
   for (const found of key.matchAll(/otp/gi)) {
@@ -68,12 +68,8 @@ function everyOtpPrintsByTheRule(key: string): boolean {
     if (startsWord || !LETTER.test(after)) return false;
     if (word[0] === 'o' && word !== 'otp') continue;
     if (word === 'Otp' || word === 'OtP' || word === 'OTp') return false;
-    if (word === 'otp' && (before === 'T' || before === 'H' || UPPER.test(after))) return false;
-    if (word === 'OTP') {
-      const lead = before === 'T' || before === 'H' ? (key[at - 2] ?? '') : before;
-      if (LOWER.test(lead)) return false;
-      if (UPPER.test(after) && LOWER.test(key[at + 4] ?? '')) return false;
-    }
+    if (word === 'otp' && UPPER.test(after)) return false;
+    if (word === 'OTP' && LOWER.test(before)) return false;
     if (!GUARD_TAILS.some((tail) => rest.toLowerCase().startsWith(tail))) return false;
   }
   return true;
@@ -323,7 +319,7 @@ describe('nothing but what the otp rule releases is released', () => {
       `|bearer|(?:(?:^|[^a-z])[ht]?otp|otp(?=$|[^a-z]))(?![^a-z0-9]*${nonSecret}$)|passphrase|`,
     );
     expect(DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN.source).toBe(
-      '(?:Otp|Totp|Hotp|[a-z][TH]?OTP|otp(?=[A-Z])|OTP(?=[A-Z][a-z])|O(?:tP|Tp)' +
+      '(?:Otp|[a-z]OTP|otp(?=[A-Z])|O(?:tP|Tp)' +
         `|(?:[A-Za-z]otp(?=[a-z])|[A-Z]OTP(?=[A-Za-z]))(?!${guard}))(?![^A-Za-z0-9]*${nonSecretAnyCase}$)`,
     );
   });

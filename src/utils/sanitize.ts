@@ -69,17 +69,16 @@ export const DEFAULT_SENSITIVE_KEY_PATTERN = new RegExp(
 /**
  * Case-SENSITIVE field-name patterns, tested as well as the pattern above, for
  * an otp with a letter on both sides. It is an otp word when the key's case
- * starts a word there (Otp, Totp, Hotp, OtP, OTp anywhere; OTP or TOTP after a
- * lower-case letter: userOtpCode, userOTPCode) or ends one (otp before a
- * capital, OTP before a capitalised word: userotpCode, MFAOTPCode), and in a
- * single-case run (userotps, USEROTPNUMBER, MFAotpcode) unless a guard word
- * runs on from its p (footprint, FOOTPRINT, footpath). A lower-case o with a
- * capital inside reads as two words (rootPath, IoTPlatform, useroTpnumber):
- * no otp word. As above, the key prints when the rest of it is a non-secret
- * word (userOtpAttempts, USEROTPSENTAT).
+ * starts a word there (Otp, OtP, OTp anywhere; OTP after a lower-case letter:
+ * userOtpCode, userOTPCode) or ends one (otp before a capital: userotpCode),
+ * and anywhere else (userotps, USEROTPNUMBER, MFAOTPCode, userTotpcode) unless
+ * a guard word runs on from its p (footprint, FOOTPRINT, footpath). A
+ * lower-case o with a capital inside reads as two words (rootPath,
+ * IoTPlatform, useroTpnumber): no otp word. As above, the key prints when the
+ * rest of it is a non-secret word (userOtpAttempts, USEROTPSENTAT).
  */
 export const DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN = new RegExp(
-  '(?:Otp|Totp|Hotp|[a-z][TH]?OTP|otp(?=[A-Z])|OTP(?=[A-Z][a-z])|O(?:tP|Tp)' +
+  '(?:Otp|[a-z]OTP|otp(?=[A-Z])|O(?:tP|Tp)' +
     `|(?:[A-Za-z]otp(?=[a-z])|[A-Z]OTP(?=[A-Za-z]))(?!${oneOf(OTP_GUARD_WORDS.map((word) => word.slice(1)), '', anyCase)}))` +
     `(?![^A-Za-z0-9]*${oneOf(OTP_NON_SECRET_SUFFIXES, '[^A-Za-z0-9]*', anyCase)}$)`,
 );
