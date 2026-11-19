@@ -25,33 +25,64 @@
  */
 
 /**
- * Field-name patterns whose VALUE is always redacted regardless of content.
- *
- * 'otp' counts only at an edge of a word of the key: where it (or totp, hotp)
- * starts the key or follows a non-letter (otp, otp_code, otpCode, totpCode,
- * x-otp), or where it ends the key or precedes a non-letter (userOtp,
- * user_totp, mfa.otp). With a letter on both sides it is the middle of another
- * word (footprint, rootPath, screenshotPath) unless a word that names a secret
- * follows it at once (userotpcode, USEROTPSEED, smsotpvalue), or the key's
- * case shows a word starting or ending there:
- * {@link DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN}.
- *
- * Not redacted: otp with a letter on both sides, none of those words after it
- * and no word edge shown by case (userotpattempts, USEROTPNUMBER, mfaSMSOTPID).
+ * Words after an otp (totp, hotp) word that name no secret. A key whose otp
+ * word is followed by separators and one of these, and nothing else, prints
+ * (otp_attempts, otpExpiresAt, userotpsentat); every other otp key redacts.
+ * The list is pinned by tests/fixtures/sensitive-keys.json
+ * (otpNonSecretSuffixes), which media-manager's redact.py reads too.
  */
-export const DEFAULT_SENSITIVE_KEY_PATTERN =
-  /pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|authorization|credential|cookie|session[-_]?id|bearer|(?:^|[^a-z])[ht]?otp|otp(?:$|[^a-z])|otp(?:auth|code|key|secret|seed|token|value|counter|uri|url|pin|digits|hash|b32|raw|recovery)|passphrase|\bpin\b|\bssn\b|\bmfa\b/i;
+const OTP_NON_SECRET_SUFFIXES = [
+  'attempts', 'count', 'enabled', 'required', 'verified', 'expires', 'expiry', 'expiresAt',
+  'sent', 'sentAt', 'length', 'type', 'method', 'channel', 'status', 'lastUsed',
+];
+/**
+ * Words that run on from the p of an otp inside a single-case word, which is
+ * then no otp word: footprint, footpath, potpourri (fixture otpGuardWords).
+ */
+const OTP_GUARD_WORDS = ['path', 'pourri', 'print'];
+
+/** A word in either case, letter by letter, for the case-sensitive pattern: at -> [aA][tT]. */
+const anyCase = (word: string): string => word.replace(/[a-z]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
+/** One of the entries; an entry's words (expiresAt: expires, at) may be split by `sep`. */
+const oneOf = (entries: readonly string[], sep: string, recase: (word: string) => string): string =>
+  `(?:${entries
+    .map((entry) => entry.split(/(?=[A-Z])/).map((word) => recase(word.toLowerCase())).join(sep))
+    .join('|')})`;
 
 /**
- * Case-SENSITIVE field-name patterns, tested as well as the pattern above: a
- * word edge that only the key's case shows. A word starting: Otp, Totp and
- * Hotp anywhere (userOtpCode, smsOtpValue, userHotpCounter), and OTP, TOTP or
- * HOTP after a lower-case letter (userOTPCode; after a digit the pattern above
- * matches). A word ending: otp before a capital (userotpCode), and OTP before
- * a capitalised word (MFAOTPCode, SMSTOTPSeed). footprint, FOOTPRINT and
- * rootPath hold none of them.
+ * Field-name patterns whose VALUE is always redacted regardless of content.
+ *
+ * otp, totp and hotp redact where they start the key or follow a non-letter
+ * (otp, otp_code, otpCode, x-otp), or end the key or precede a non-letter
+ * (userOtp, user_totp, mfa.otp); with a letter on both sides,
+ * {@link DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN} reads the key's case. Either way
+ * the key prints when the rest of it is a non-secret word (otp_attempts).
  */
-export const DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN = /Otp|Totp|Hotp|[a-z][TH]?OTP|otp(?=[A-Z])|OTP(?=[A-Z][a-z])/;
+export const DEFAULT_SENSITIVE_KEY_PATTERN = new RegExp(
+  'pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|authorization' +
+    '|credential|cookie|session[-_]?id|bearer|(?:(?:^|[^a-z])[ht]?otp|otp(?=$|[^a-z]))' +
+    `(?![^a-z0-9]*${oneOf(OTP_NON_SECRET_SUFFIXES, '[^a-z0-9]*', (word) => word)}$)` +
+    '|passphrase|\\bpin\\b|\\bssn\\b|\\bmfa\\b',
+  'i',
+);
+
+/**
+ * Case-SENSITIVE field-name patterns, tested as well as the pattern above, for
+ * an otp with a letter on both sides. It is an otp word when the key's case
+ * starts a word there (Otp, Totp, Hotp, OtP, OTp anywhere; OTP or TOTP after a
+ * lower-case letter: userOtpCode, userOTPCode) or ends one (otp before a
+ * capital, OTP before a capitalised word: userotpCode, MFAOTPCode), and in a
+ * single-case run (userotps, USEROTPNUMBER, MFAotpcode) unless a guard word
+ * runs on from its p (footprint, FOOTPRINT, footpath). A lower-case o with a
+ * capital inside reads as two words (rootPath, IoTPlatform, useroTpnumber):
+ * no otp word. As above, the key prints when the rest of it is a non-secret
+ * word (userOtpAttempts, USEROTPSENTAT).
+ */
+export const DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN = new RegExp(
+  '(?:Otp|Totp|Hotp|[a-z][TH]?OTP|otp(?=[A-Z])|OTP(?=[A-Z][a-z])|O(?:tP|Tp)' +
+    `|(?:[A-Za-z]otp(?=[a-z])|[A-Z]OTP(?=[A-Za-z]))(?!${oneOf(OTP_GUARD_WORDS.map((word) => word.slice(1)), '', anyCase)}))` +
+    `(?![^A-Za-z0-9]*${oneOf(OTP_NON_SECRET_SUFFIXES, '[^A-Za-z0-9]*', anyCase)}$)`,
+);
 
 /** Well-known secret SHAPES masked wherever they appear inside a string value. */
 export const DEFAULT_SECRET_VALUE_PATTERNS: readonly RegExp[] = [
